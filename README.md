@@ -51,20 +51,55 @@ TEST_DATABASE_URL=postgres://… go test ./...   # also runs Postgres integratio
 
 ## Deploy
 
-The image is a tiny static binary on Alpine:
+A tiny static binary in a ~10 MB Alpine image — any container host works.
+Clients require `https://`, so terminate TLS at the platform edge or a reverse
+proxy.
+
+### Docker (anywhere)
 
 ```sh
-docker build -t hive-relay .          # then run with the env above
+docker build -t hive-relay .            # or straight from GitHub:
+# docker build -t hive-relay https://github.com/honeyhive-ai/relay.git
+docker run -d -p 8443:8443 -v hive-data:/data -e HIVE_RELAY_DATA_DIR=/data hive-relay
+curl localhost:8443/v1/health           # → ok
 ```
 
-`deploy/fly.toml` is a ready Fly.io config (`fly launch --copy-config`). Put TLS
-in front (Fly's edge, or your own LB) so clients get an `https://` URL, and
-either mount a volume at `/data` (snapshot store) or set `DATABASE_URL` (shared
-Postgres → scale out).
+### Fly.io (always-on, free-tier friendly)
 
-To **gate** a self-hosted relay, set `HIVE_RELAY_TOKEN_PUBKEY` and mint tokens
-with `hive-relay keygen` / `hive-relay issue` — keep the issuer private key off
-the relay host (the relay only ever verifies).
+`deploy/fly.toml` is ready to go:
+
+```sh
+fly launch --copy-config --no-deploy    # pick an app name + region
+fly volumes create hive_data --size 1 --region <region>
+fly deploy
+fly status                              # → https://<app>.fly.dev
+```
+
+Fly terminates TLS at its edge, so clients get an `https://` URL for free.
+
+### TLS on a plain VM (Caddy example)
+
+```caddyfile
+relay.example.com {
+    reverse_proxy localhost:8443
+}
+```
+
+### Persistence & scaling
+
+- **Single instance:** mount a volume at `/data` and set `HIVE_RELAY_DATA_DIR=/data`
+  (JSON snapshot store; survives restarts). Nothing to back up but that volume.
+- **HA / multiple instances:** set `DATABASE_URL` to a shared Postgres — it takes
+  precedence over the snapshot dir, so every instance shares state (no migration).
+
+### Optional access gating
+
+Open by default (self-host — the URL isn't a secret). To gate:
+
+- **Allowlist:** `HIVE_RELAY_ACCESS_TOKENS=tokA,tokB` (opaque bearer tokens).
+- **Signed tokens:** set `HIVE_RELAY_TOKEN_PUBKEY=<hex>` and mint per-subject
+  tokens with `hive-relay keygen` / `hive-relay issue` — keep the issuer private
+  key off the relay host (the relay only ever verifies).
 
 ## Extending (seams)
 
