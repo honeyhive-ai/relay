@@ -64,20 +64,21 @@ docker run -d -p 8443:8443 -v hive-data:/data -e HIVE_RELAY_DATA_DIR=/data hive-
 curl localhost:8443/v1/health           # → ok
 ```
 
-### Fly.io (always-on, free-tier friendly)
+### Managed platforms
 
-`deploy/fly.toml` is ready to go:
+No lock-in — it's a standard container. The binary honors `$PORT` (else
+`$HIVE_RELAY_ADDR`, else `0.0.0.0:8443`), so most PaaS work with zero config:
+point Render / Railway / Cloud Run / Kubernetes / a VM at the image (or the
+Dockerfile), attach a disk at `/data`, and set `HIVE_RELAY_DATA_DIR=/data`.
 
-```sh
-fly launch --copy-config --no-deploy    # pick an app name + region
-fly volumes create hive_data --size 1 --region <region>
-fly deploy
-fly status                              # → https://<app>.fly.dev
-```
+A sample **`deploy/fly.toml`** is included as one worked example (`fly launch
+--copy-config --no-deploy` → `fly volumes create hive_data …` → `fly deploy`) —
+adapt it, or use your platform's equivalent.
 
-Fly terminates TLS at its edge, so clients get an `https://` URL for free.
+### TLS
 
-### TLS on a plain VM (Caddy example)
+Clients need `https://` — either let your platform terminate TLS at its edge, or
+run any reverse proxy (Caddy example):
 
 ```caddyfile
 relay.example.com {
