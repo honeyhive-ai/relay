@@ -1,0 +1,42 @@
+# Fly.io config for a self-hosted hive-relay. Deploy from this repo root:
+#   fly launch --copy-config --no-deploy   # pick app name / region
+#   fly deploy
+# Fly terminates TLS at its edge and forwards 443 → internal_port (8443), giving
+# you an https://<app>.fly.dev URL to point the client at.
+
+app = "hive-relay"          # `fly launch` offers to pick a unique name
+primary_region = "iad"      # change to one near your users (e.g. lhr, fra, sjc)
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # In-memory + JSON snapshot on the volume below (single instance). For HA, set
+  # DATABASE_URL to a shared Postgres as a secret (`fly secrets set DATABASE_URL=…`)
+  # and remove this + the mount — DATABASE_URL takes precedence, and you can then
+  # raise min_machines_running.
+  HIVE_RELAY_DATA_DIR = "/data"
+
+# Persistent volume for the snapshot store. Create once before first deploy:
+#   fly volumes create hive_data --size 1 --region <primary_region>
+[[mounts]]
+  source = "hive_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8443
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1  # snapshot store = single instance; use Postgres to scale out
+
+[[http_service.http_checks]]
+  method = "get"
+  path = "/v1/health"
+  interval = "15s"
+  timeout = "2s"
+  grace_period = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

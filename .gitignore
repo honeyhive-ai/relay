@@ -1,0 +1,5 @@
+# Built binaries — anchored to the module root so they never match the
+# cmd/hive-relay source directory.
+/hive-relay
+/relay
+*.test
