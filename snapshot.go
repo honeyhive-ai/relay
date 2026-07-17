@@ -25,6 +25,14 @@ type snapshot struct {
 	LoginIndex  map[string]string        `json:"loginIndex"`
 	FriendReqs  map[string]FriendRequest `json:"friendRequests"`
 	FriendEdges [][2]string              `json:"friendEdges"`
+	Users       map[string]UserRecord    `json:"users,omitempty"`
+	Tokens      map[string]tokenSnap     `json:"tokens,omitempty"`
+	NextIDSeq   uint64                   `json:"nextIdSeq,omitempty"`
+}
+
+type tokenSnap struct {
+	Rec  TokenRecord `json:"rec"`
+	Hash string      `json:"hash"`
 }
 
 type wsSnap struct {
@@ -145,6 +153,20 @@ func (s *memoryStore) restore(snap snapshot) {
 	for _, pair := range snap.FriendEdges {
 		s.friendEdges[pair] = struct{}{}
 	}
+
+	s.users = map[string]*UserRecord{}
+	for id := range snap.Users {
+		u := snap.Users[id]
+		s.users[id] = &u
+	}
+	s.tokens = map[string]*memToken{}
+	s.tokenHash = map[string]string{}
+	for id, t := range snap.Tokens {
+		tok := &memToken{rec: t.Rec, hash: t.Hash}
+		s.tokens[id] = tok
+		s.tokenHash[t.Hash] = id
+	}
+	s.nextIDSeq = snap.NextIDSeq
 }
 
 func (s *memoryStore) toSnapshot() snapshot {
@@ -158,6 +180,15 @@ func (s *memoryStore) toSnapshot() snapshot {
 		LoginIndex:  map[string]string{},
 		FriendReqs:  map[string]FriendRequest{},
 		FriendEdges: [][2]string{},
+		Users:       map[string]UserRecord{},
+		Tokens:      map[string]tokenSnap{},
+		NextIDSeq:   s.nextIDSeq,
+	}
+	for id, u := range s.users {
+		snap.Users[id] = *u
+	}
+	for id, t := range s.tokens {
+		snap.Tokens[id] = tokenSnap{Rec: t.rec, Hash: t.hash}
 	}
 	for id, w := range s.workspaces {
 		snap.Workspaces[id] = wsSnap{

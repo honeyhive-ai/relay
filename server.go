@@ -29,6 +29,7 @@ type Options struct {
 	WriteGuard  WriteGuard          // nil → allow all writes (content-blind)
 	Hooks       Hooks               // nil → no-op
 	FriendCap   *int                // nil → unlimited
+	AdminAuth   AdminAuthorizer     // nil → /v1/admin/* disabled (404)
 }
 
 // Server holds the durable Store plus the ephemeral, instance-local pieces
@@ -38,6 +39,7 @@ type Server struct {
 	entitlement EntitlementVerifier
 	guard       WriteGuard // nil = content-blind (no membership check)
 	hooks       Hooks      // nil = no-op
+	adminAuth   AdminAuthorizer // nil = admin API disabled
 	friendCap   *int
 	httpClient  *http.Client
 	// verify authenticates a GitHub token → user. Defaults to verifyGitHub
@@ -63,6 +65,7 @@ func New(o Options) *Server {
 		entitlement: o.Entitlement,
 		guard:       o.WriteGuard,
 		hooks:       o.Hooks,
+		adminAuth:   o.AdminAuth,
 		friendCap:   o.FriendCap,
 		httpClient:  &http.Client{Timeout: 10 * time.Second},
 		pairings:    map[string]pairing{},
@@ -122,6 +125,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/friends/requests/{id}/accept", s.friendRequestAccept)
 	mux.HandleFunc("POST /v1/friends/requests/{id}/reject", s.friendRequestReject)
 
+	// User/token management — gated by the AdminAuthorizer seam (not the relay
+	// entitlement token), so these bypass the entitlement gate below.
+	mux.HandleFunc("POST /v1/admin/users", s.adminCreateUser)
+	mux.HandleFunc("GET /v1/admin/users", s.adminListUsers)
+	mux.HandleFunc("POST /v1/admin/users/{id}/tokens", s.adminIssueToken)
+	mux.HandleFunc("POST /v1/admin/users/{id}/disabled", s.adminSetDisabled)
+	mux.HandleFunc("DELETE /v1/admin/tokens/{id}", s.adminRevokeToken)
+
 	return s.gate(mux)
 }
 
@@ -129,7 +140,9 @@ func (s *Server) Handler() http.Handler {
 // the verified claims in the request context for downstream enforcement.
 func (s *Server) gate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/health" {
+		if r.URL.Path == "/v1/health" || strings.HasPrefix(r.URL.Path, "/v1/admin/") {
+			// Health is public; the admin API runs its own AdminAuthorizer
+			// (an operator credential, not a relay token).
 			next.ServeHTTP(w, r)
 			return
 		}

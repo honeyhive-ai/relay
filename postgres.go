@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -131,6 +132,26 @@ CREATE TABLE IF NOT EXISTS relay_friend_edges (
   b TEXT NOT NULL,
   PRIMARY KEY (a, b)
 );
+-- Durable relay access users + tokens (replaces the env-var token allowlist).
+-- Tokens are stored only as a SHA-256 hash; the raw value is shown once at issue.
+CREATE TABLE IF NOT EXISTS relay_users (
+  id         TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  login      TEXT NOT NULL DEFAULT '',
+  disabled   BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS relay_tokens (
+  id         TEXT PRIMARY KEY,
+  user_id    TEXT NOT NULL REFERENCES relay_users(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL UNIQUE,
+  label      TEXT NOT NULL DEFAULT '',
+  created_at BIGINT NOT NULL,
+  last_used  BIGINT NOT NULL DEFAULT 0,
+  revoked_at BIGINT
+);
+CREATE INDEX IF NOT EXISTS relay_tokens_hash ON relay_tokens (token_hash);
+CREATE INDEX IF NOT EXISTS relay_tokens_user ON relay_tokens (user_id);
 `
 
 // pgxQuerier is satisfied by both *pgxpool.Pool and pgx.Tx, so read/helper
@@ -731,4 +752,128 @@ func (s *postgresStore) nextSeqTx(ctx context.Context, tx pgx.Tx, scope string) 
 		 ON CONFLICT (scope) DO UPDATE SET next_seq = relay_seq.next_seq + 1
 		 RETURNING next_seq`, scope).Scan(&seq)
 	return seq, err
+}
+
+// ── Users + access tokens ────────────────────────────────────────────────────
+
+func (s *postgresStore) CreateUser(ctx context.Context, name, login string, now int64) (UserRecord, error) {
+	u := UserRecord{ID: newObjectID("usr"), Name: name, Login: login, CreatedAt: now}
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO relay_users (id, name, login, disabled, created_at) VALUES ($1, $2, $3, FALSE, $4)`,
+		u.ID, u.Name, u.Login, u.CreatedAt)
+	if err != nil {
+		return UserRecord{}, err
+	}
+	return u, nil
+}
+
+func (s *postgresStore) ListUsers(ctx context.Context) ([]UserRecord, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, name, login, disabled, created_at FROM relay_users ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UserRecord
+	for rows.Next() {
+		var u UserRecord
+		if err := rows.Scan(&u.ID, &u.Name, &u.Login, &u.Disabled, &u.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) SetUserDisabled(ctx context.Context, userID string, disabled bool) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE relay_users SET disabled = $2 WHERE id = $1`, userID, disabled)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrUserNotFound
+	}
+	return nil
+}
+
+func (s *postgresStore) IssueToken(ctx context.Context, userID, label, tokenHash string, now int64) (TokenRecord, error) {
+	rec := TokenRecord{ID: newObjectID("tok"), UserID: userID, Label: label, CreatedAt: now}
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO relay_tokens (id, user_id, token_hash, label, created_at) VALUES ($1, $2, $3, $4, $5)`,
+		rec.ID, rec.UserID, tokenHash, rec.Label, rec.CreatedAt)
+	if err != nil {
+		// FK violation ⇒ unknown user.
+		if strings.Contains(err.Error(), "relay_tokens_user_id_fkey") {
+			return TokenRecord{}, ErrUserNotFound
+		}
+		return TokenRecord{}, err
+	}
+	return rec, nil
+}
+
+func (s *postgresStore) ListTokens(ctx context.Context) ([]TokenRecord, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, user_id, label, created_at, last_used, revoked_at FROM relay_tokens ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TokenRecord
+	for rows.Next() {
+		var t TokenRecord
+		var lastUsed int64
+		if err := rows.Scan(&t.ID, &t.UserID, &t.Label, &t.CreatedAt, &lastUsed, &t.RevokedAt); err != nil {
+			return nil, err
+		}
+		t.LastUsed = lastUsed
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) RevokeToken(ctx context.Context, tokenID string, now int64) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE relay_tokens SET revoked_at = $2 WHERE id = $1 AND revoked_at IS NULL`,
+		tokenID, now)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		// Either unknown or already revoked; treat unknown as not-found.
+		var exists bool
+		_ = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM relay_tokens WHERE id = $1)`, tokenID).Scan(&exists)
+		if !exists {
+			return ErrTokenNotFound
+		}
+	}
+	return nil
+}
+
+func (s *postgresStore) ResolveToken(ctx context.Context, tokenHash string, now int64) (*TokenClaims, bool, error) {
+	var (
+		userID   string
+		login    string
+		disabled bool
+		revoked  *int64
+	)
+	err := s.pool.QueryRow(ctx,
+		`SELECT t.user_id, u.login, u.disabled, t.revoked_at
+		   FROM relay_tokens t JOIN relay_users u ON u.id = t.user_id
+		  WHERE t.token_hash = $1`, tokenHash).Scan(&userID, &login, &disabled, &revoked)
+	if err != nil {
+		if strings.Contains(err.Error(), "no rows") {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if disabled || revoked != nil {
+		return nil, false, nil
+	}
+	// Best-effort last-used stamp (don't fail the request on it).
+	_, _ = s.pool.Exec(ctx, `UPDATE relay_tokens SET last_used = $2 WHERE token_hash = $1`, tokenHash, now)
+	sub := login
+	if sub == "" {
+		sub = userID
+	}
+	return &TokenClaims{Sub: sub, Plan: "team"}, true, nil
 }

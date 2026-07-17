@@ -39,6 +39,16 @@ type WriteGuard interface {
 	CheckWrite(ctx context.Context, workspace string, claims *TokenClaims, r *http.Request) error
 }
 
+// AdminAuthorizer gates the user/token management API (/v1/admin/*). It runs
+// instead of the entitlement gate for those routes — an operator manages access
+// tokens with their own credential, not a relay token. Return (adminID, true)
+// to admit. Default nil = the admin API is disabled (404). A downstream build
+// supplies one (e.g. a GitHub-admin allowlist) to enable durable, no-redeploy
+// user management. See users.go.
+type AdminAuthorizer interface {
+	AuthorizeAdmin(r *http.Request) (adminID string, ok bool)
+}
+
 // Hooks observe successful operations for audit + usage metering. All methods
 // must tolerate a nil claims (open / token-allowlist policies carry none). The
 // open relay leaves this nil (no-op).

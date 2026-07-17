@@ -171,6 +171,14 @@ func newRequestID() string {
 	return "fr" + hex.EncodeToString(b[:])
 }
 
+// newObjectID is an opaque, collision-resistant id with a short type prefix
+// (e.g. "usr", "tok").
+func newObjectID(prefix string) string {
+	var b [12]byte
+	_, _ = rand.Read(b[:])
+	return prefix + "_" + hex.EncodeToString(b[:])
+}
+
 // randRead fills b with cryptographically-random bytes.
 func randRead(b []byte) { _, _ = rand.Read(b) }
 
@@ -234,6 +242,18 @@ type Store interface {
 	FriendDevices(ctx context.Context, caller, friend string) ([]DeviceRow, bool, error)
 	FriendCount(ctx context.Context, account string) (int, error)
 	FriendPresence(ctx context.Context, account string, now int64) ([]FriendPresence, error)
+
+	// Relay access users + tokens (durable per-person credentials; see users.go).
+	// Tokens are stored only as SHA-256 hashes.
+	CreateUser(ctx context.Context, name, login string, now int64) (UserRecord, error)
+	ListUsers(ctx context.Context) ([]UserRecord, error)
+	SetUserDisabled(ctx context.Context, userID string, disabled bool) error
+	IssueToken(ctx context.Context, userID, label, tokenHash string, now int64) (TokenRecord, error)
+	ListTokens(ctx context.Context) ([]TokenRecord, error)
+	RevokeToken(ctx context.Context, tokenID string, now int64) error
+	// ResolveToken maps a presented token's hash to entitlement claims iff it is
+	// live (not revoked, owning user enabled). Stamps last-used best-effort.
+	ResolveToken(ctx context.Context, tokenHash string, now int64) (*TokenClaims, bool, error)
 
 	// Durability (snapshot-backed stores only; no-op otherwise).
 	Flush(ctx context.Context) error

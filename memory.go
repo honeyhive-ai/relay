@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -22,7 +23,17 @@ type memoryStore struct {
 	friendReqs  map[string]*FriendRequest
 	friendEdges map[[2]string]struct{}
 
+	users     map[string]*UserRecord // user id → record
+	tokens    map[string]*memToken   // token id → record
+	tokenHash map[string]string      // token hash → token id
+	nextIDSeq uint64                 // monotonic id source for users/tokens
+
 	persistPath string // "" = in-memory only
+}
+
+type memToken struct {
+	rec  TokenRecord
+	hash string
 }
 
 type memWorkspace struct {
@@ -55,6 +66,9 @@ func newMemoryStore() *memoryStore {
 		loginIndex:  map[string]string{},
 		friendReqs:  map[string]*FriendRequest{},
 		friendEdges: map[[2]string]struct{}{},
+		users:       map[string]*UserRecord{},
+		tokens:      map[string]*memToken{},
+		tokenHash:   map[string]string{},
 	}
 }
 
@@ -514,4 +528,102 @@ func lower(s string) string { return strings.ToLower(s) }
 // for login-index and directory lookups.
 func normHandle(s string) string {
 	return strings.ToLower(strings.TrimPrefix(strings.TrimSpace(s), "@"))
+}
+
+// ── Users + access tokens ────────────────────────────────────────────────────
+
+func (s *memoryStore) nextID(prefix string) string {
+	s.nextIDSeq++
+	return fmt.Sprintf("%s_%d", prefix, s.nextIDSeq)
+}
+
+func (s *memoryStore) CreateUser(_ context.Context, name, login string, now int64) (UserRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u := UserRecord{ID: s.nextID("usr"), Name: name, Login: login, CreatedAt: now}
+	s.users[u.ID] = &u
+	return u, nil
+}
+
+func (s *memoryStore) ListUsers(_ context.Context) ([]UserRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]UserRecord, 0, len(s.users))
+	for _, u := range s.users {
+		out = append(out, *u)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
+	return out, nil
+}
+
+func (s *memoryStore) SetUserDisabled(_ context.Context, userID string, disabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[userID]
+	if !ok {
+		return ErrUserNotFound
+	}
+	u.Disabled = disabled
+	return nil
+}
+
+func (s *memoryStore) IssueToken(_ context.Context, userID, label, tokenHash string, now int64) (TokenRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.users[userID]; !ok {
+		return TokenRecord{}, ErrUserNotFound
+	}
+	rec := TokenRecord{ID: s.nextID("tok"), UserID: userID, Label: label, CreatedAt: now}
+	s.tokens[rec.ID] = &memToken{rec: rec, hash: tokenHash}
+	s.tokenHash[tokenHash] = rec.ID
+	return rec, nil
+}
+
+func (s *memoryStore) ListTokens(_ context.Context) ([]TokenRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]TokenRecord, 0, len(s.tokens))
+	for _, t := range s.tokens {
+		out = append(out, t.rec)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
+	return out, nil
+}
+
+func (s *memoryStore) RevokeToken(_ context.Context, tokenID string, now int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.tokens[tokenID]
+	if !ok {
+		return ErrTokenNotFound
+	}
+	if t.rec.RevokedAt == nil {
+		n := now
+		t.rec.RevokedAt = &n
+	}
+	delete(s.tokenHash, t.hash) // no longer resolvable
+	return nil
+}
+
+func (s *memoryStore) ResolveToken(_ context.Context, tokenHash string, now int64) (*TokenClaims, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.tokenHash[tokenHash]
+	if !ok {
+		return nil, false, nil
+	}
+	t := s.tokens[id]
+	if t == nil || t.rec.RevokedAt != nil {
+		return nil, false, nil
+	}
+	u := s.users[t.rec.UserID]
+	if u == nil || u.Disabled {
+		return nil, false, nil
+	}
+	t.rec.LastUsed = now
+	sub := u.Login
+	if sub == "" {
+		sub = u.ID
+	}
+	return &TokenClaims{Sub: sub, Plan: "team"}, true, nil
 }
