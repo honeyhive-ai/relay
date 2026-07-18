@@ -101,6 +101,30 @@ Open by default (self-host — the URL isn't a secret). To gate:
 - **Signed tokens:** set `HIVE_RELAY_TOKEN_PUBKEY=<hex>` and mint per-subject
   tokens with `hive-relay keygen` / `hive-relay issue` — keep the issuer private
   key off the relay host (the relay only ever verifies).
+- **Durable users + tokens:** manage per-person access over the admin API
+  (below) instead of an env list — no redeploy, survives restarts, instant
+  revocation. Pair it with `StoreEntitlementVerifier` to make the store the
+  access gate.
+
+### User/token admin API (`/v1/admin/*`)
+
+The relay has a durable user + token store (both backends implement it) and a
+management API, gated by the `AdminAuthorizer` seam. It's **disabled by
+default** (no authorizer → `404`); supply one via `Options{AdminAuth: …}` to
+enable it. Tokens are stored only as SHA-256 hashes; the raw value is returned
+once at creation.
+
+- `POST /v1/admin/users` `{name, login?}` → create user + first token (raw once)
+- `GET /v1/admin/users` → users + their tokens (no hashes)
+- `POST /v1/admin/users/{id}/tokens` `{label?}` → another token (raw once)
+- `POST /v1/admin/users/{id}/disabled` `{disabled}` → enable/disable a user
+- `DELETE /v1/admin/tokens/{id}` → revoke a token
+
+### Status page
+
+`GET /` serves a small public HTML status page ("Hive relay · online") so a
+human who opens the URL sees an intentional page rather than a `401`. `GET
+/v1/health` returns `ok`. Everything else is token-gated.
 
 ## Extending (seams)
 
@@ -108,9 +132,11 @@ This package is a complete relay on its own. It also exposes extension points
 (see `seams.go`) so a downstream build can add custom behavior via
 `New(Options{...})` without forking:
 
-- **`Store`** — durable backend (in-memory/snapshot or Postgres built in).
+- **`Store`** — durable backend (in-memory/snapshot or Postgres built in);
+  includes the user/token store behind the admin API.
 - **`EntitlementVerifier`** — admission policy (open / allowlist / signed from
-  env, or your own).
+  env, `StoreEntitlementVerifier` for managed tokens, or your own).
+- **`AdminAuthorizer`** — gates `/v1/admin/*` user management (`nil` = disabled).
 - **`WriteGuard`** — optional pre-write authorization hook (`nil` = content-blind).
 - **`Hooks`** — optional lifecycle observers (e.g. audit / accounting; no-op by
   default).
