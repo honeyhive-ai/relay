@@ -138,3 +138,27 @@ func TestAdminAPIDisabledWithoutAuthorizer(t *testing.T) {
 		t.Fatalf("admin API should be 404 without an authorizer, got %d", rec.Code)
 	}
 }
+
+func TestStatusPageIsPublic(t *testing.T) {
+	// A store-backed verifier gates everything (unknown token → reject), so the
+	// status page being public is a deliberate carve-out, not the open default.
+	store := newMemoryStore()
+	s := New(Options{Store: store, Entitlement: StoreEntitlementVerifier{Store: store}})
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("root status page should be 200 without a token, got %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("expected html, got %q", ct)
+	}
+	if !strings.Contains(rec.Body.String(), "Hive relay") {
+		t.Fatal("status page should mention Hive relay")
+	}
+	// A gated API path with no token still 401s (page didn't open a hole).
+	rec2 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec2, httptest.NewRequest("GET", "/v1/workspaces/w/envelopes?after=0", nil))
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("gated path must still 401, got %d", rec2.Code)
+	}
+}

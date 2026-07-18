@@ -90,6 +90,8 @@ func nowUnix() int64 { return time.Now().Unix() }
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
+	// Public landing page at the exact root, and the health check.
+	mux.HandleFunc("GET /{$}", s.statusPage)
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok"))
@@ -140,9 +142,9 @@ func (s *Server) Handler() http.Handler {
 // the verified claims in the request context for downstream enforcement.
 func (s *Server) gate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/health" || strings.HasPrefix(r.URL.Path, "/v1/admin/") {
-			// Health is public; the admin API runs its own AdminAuthorizer
-			// (an operator credential, not a relay token).
+		if r.URL.Path == "/" || r.URL.Path == "/v1/health" || strings.HasPrefix(r.URL.Path, "/v1/admin/") {
+			// The status page + health are public; the admin API runs its own
+			// AdminAuthorizer (an operator credential, not a relay token).
 			next.ServeHTTP(w, r)
 			return
 		}
