@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 )
 
 var bg = context.Background()
@@ -14,6 +15,73 @@ func strptr(s string) *string { return &s }
 func raw(s string) json.RawMessage { return json.RawMessage(s) }
 
 func capOf(n int) *int { return &n }
+
+// ── Envelope retention ─────────────────────────────────────────────────────────
+
+func TestRetentionCountCapPrunesOldest(t *testing.T) {
+	s := newMemoryStore()
+	s.retentionMaxEnvelopes = 3
+	s.retentionMaxAge = 0
+	for i := 0; i < 10; i++ {
+		if _, err := s.AppendEnvelope(bg, "ws", raw(`{"n":1}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Only the newest 3 (seq 8,9,10) survive; older seqs are pruned.
+	rows, _ := s.EnvelopesAfter(bg, "ws", 0)
+	if len(rows) != 3 {
+		t.Fatalf("want 3 retained, got %d", len(rows))
+	}
+	if rows[0].Seq != 8 || rows[2].Seq != 10 {
+		t.Fatalf("want seqs 8..10, got %d..%d", rows[0].Seq, rows[2].Seq)
+	}
+	// nextSeq keeps advancing — cursor semantics hold: a client at after=10 sees
+	// nothing, and pruning never rewinds the sequence.
+	if _, _ = s.AppendEnvelope(bg, "ws", raw(`{}`)); rows[2].Seq != 10 {
+		t.Fatal("pruning must not rewind seq")
+	}
+	if rows, _ := s.EnvelopesAfter(bg, "ws", 11); len(rows) != 0 {
+		t.Fatalf("after=11 should be empty, got %d", len(rows))
+	}
+}
+
+func TestRetentionAgePrunesStale(t *testing.T) {
+	s := newMemoryStore()
+	s.retentionMaxEnvelopes = 0
+	s.retentionMaxAge = time.Hour
+	w := s.workspace("ws")
+	// Two envelopes appended "2h ago", one fresh — the stale pair is pruned on
+	// the next append.
+	old := time.Now().Add(-2 * time.Hour).Unix()
+	w.envelopes = []Envelope{{Seq: 1, Body: raw(`{}`)}, {Seq: 2, Body: raw(`{}`)}}
+	w.envAt = []int64{old, old}
+	w.nextSeq = 2
+	if _, err := s.AppendEnvelope(bg, "ws", raw(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := s.EnvelopesAfter(bg, "ws", 0)
+	if len(rows) != 1 || rows[0].Seq != 3 {
+		t.Fatalf("want only fresh seq 3, got %+v", rows)
+	}
+}
+
+func TestRetentionDisabledKeepsAll(t *testing.T) {
+	s := newMemoryStore()
+	s.retentionMaxEnvelopes = 0
+	s.retentionMaxAge = 0
+	for i := 0; i < 100; i++ {
+		_, _ = s.AppendEnvelope(bg, "ws", raw(`{}`))
+	}
+	if rows, _ := s.EnvelopesAfter(bg, "ws", 0); len(rows) != 100 {
+		t.Fatalf("unbounded retention should keep all 100, got %d", len(rows))
+	}
+}
+
+func TestPingSucceedsOnMemoryStore(t *testing.T) {
+	if err := newMemoryStore().Ping(bg); err != nil {
+		t.Fatalf("memory store ping should succeed: %v", err)
+	}
+}
 
 // ── Account registry + inbox ──────────────────────────────────────────────────
 

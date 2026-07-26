@@ -57,7 +57,18 @@ func Main() {
 	}
 
 	addr := resolveAddr()
-	httpServer := &http.Server{Addr: addr, Handler: srv.Handler()}
+	// Timeouts bound how long a single connection can tie up resources, which
+	// defends against Slowloris (trickled headers/body) and stuck peers. The
+	// relay is poll-based, not long-lived streaming, so modest read/write
+	// deadlines are safe.
+	httpServer := &http.Server{
+		Addr:              addr,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	// Stop on Ctrl-C or SIGTERM (a redeploy from the orchestrator).
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

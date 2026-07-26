@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Durable persistence for memoryStore: snapshot the durable maps to a JSON file
@@ -36,7 +37,12 @@ type tokenSnap struct {
 }
 
 type wsSnap struct {
-	Envelopes  []Envelope                 `json:"envelopes"`
+	Envelopes []Envelope `json:"envelopes"`
+	// EnvAt carries the per-envelope append times so age-based retention survives
+	// a restart. Omitted by (and absent from) older snapshots; on load a missing
+	// or mismatched-length EnvAt is backfilled to "now" so pre-existing history
+	// isn't age-pruned on the first boot after upgrade.
+	EnvAt      []int64                    `json:"envAt,omitempty"`
 	NextSeq    uint64                     `json:"nextSeq"`
 	Candidates map[string]json.RawMessage `json:"candidates"`
 	Presence   map[string]json.RawMessage `json:"presence"`
@@ -105,13 +111,26 @@ func (s *memoryStore) restore(snap snapshot) {
 		if pres == nil {
 			pres = map[string]json.RawMessage{}
 		}
-		s.workspaces[id] = &memWorkspace{
+		envAt := w.EnvAt
+		if len(envAt) != len(w.Envelopes) {
+			// Older snapshot (no times) or a length mismatch: stamp everything
+			// "now" so retention measures age from this boot, not from epoch.
+			now := time.Now().Unix()
+			envAt = make([]int64, len(w.Envelopes))
+			for i := range envAt {
+				envAt[i] = now
+			}
+		}
+		ws := &memWorkspace{
 			envelopes:  w.Envelopes,
+			envAt:      envAt,
 			nextSeq:    w.NextSeq,
 			candidates: cand,
 			presence:   pres,
 			keyring:    w.Keyring,
 		}
+		s.pruneEnvelopesLocked(ws, time.Now().Unix())
+		s.workspaces[id] = ws
 	}
 
 	s.directory = map[string]*DirAccount{}
@@ -192,7 +211,7 @@ func (s *memoryStore) toSnapshot() snapshot {
 	}
 	for id, w := range s.workspaces {
 		snap.Workspaces[id] = wsSnap{
-			Envelopes: w.envelopes, NextSeq: w.nextSeq,
+			Envelopes: w.envelopes, EnvAt: w.envAt, NextSeq: w.nextSeq,
 			Candidates: w.candidates, Presence: w.presence, Keyring: w.keyring,
 		}
 	}

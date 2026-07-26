@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -185,6 +186,61 @@ func TestFriendRequestFlowOverHTTP(t *testing.T) {
 	// Gated identity route without a token → 401.
 	if resp, _ := do(t, "GET", ts.URL+"/v1/account/devices", "", nil); resp.StatusCode != 401 {
 		t.Fatalf("no github token want 401, got %d", resp.StatusCode)
+	}
+}
+
+// pingFailStore wraps a memoryStore but reports the store as unreachable, so a
+// health probe can be driven to 503.
+type pingFailStore struct {
+	*memoryStore
+	err error
+}
+
+func (p pingFailStore) Ping(context.Context) error { return p.err }
+
+func TestHealthReturns503WhenStorePingFails(t *testing.T) {
+	store := pingFailStore{memoryStore: newMemoryStore(), err: errors.New("db down")}
+	srv := New(Options{Store: store, Entitlement: entitlementPolicy{kind: entOpen}})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	if resp, _ := do(t, "GET", ts.URL+"/v1/health", "", nil); resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("failing store ping want 503, got %d", resp.StatusCode)
+	}
+}
+
+func TestOversizedBodyRejected(t *testing.T) {
+	ts := testServer(entitlementPolicy{kind: entOpen}, nil)
+	defer ts.Close()
+
+	// Shrink the cap for the duration of this test.
+	saved := maxRequestBodyBytes
+	maxRequestBodyBytes = 512
+	defer func() { maxRequestBodyBytes = saved }()
+
+	big := json.RawMessage(`"` + strings.Repeat("A", 4096) + `"`)
+	resp, _ := do(t, "POST", ts.URL+"/v1/workspaces/ws1/envelopes", "", big)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body want 413, got %d", resp.StatusCode)
+	}
+	// A body under the cap still works.
+	if resp, _ := do(t, "POST", ts.URL+"/v1/workspaces/ws1/envelopes", "", json.RawMessage(`{"ok":1}`)); resp.StatusCode != 200 {
+		t.Fatalf("small body want 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestPairingResolveRateLimited(t *testing.T) {
+	ts := testServer(entitlementPolicy{kind: entOpen}, nil)
+	defer ts.Close()
+
+	// maxResolveFailures misses are allowed (each 404); the next is throttled.
+	for i := 0; i < maxResolveFailures; i++ {
+		if resp, _ := do(t, "GET", ts.URL+"/v1/pair/ZZZZZZ", "", nil); resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("miss %d want 404, got %d", i, resp.StatusCode)
+		}
+	}
+	if resp, _ := do(t, "GET", ts.URL+"/v1/pair/ZZZZZZ", "", nil); resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("over cap want 429, got %d", resp.StatusCode)
 	}
 }
 

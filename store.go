@@ -255,6 +255,11 @@ type Store interface {
 	// live (not revoked, owning user enabled). Stamps last-used best-effort.
 	ResolveToken(ctx context.Context, tokenHash string, now int64) (*TokenClaims, bool, error)
 
+	// Ping cheaply checks the backend is reachable, backing /v1/health so an
+	// orchestrator's liveness/readiness probe reflects real store availability.
+	// memoryStore always succeeds; postgresStore round-trips to the database.
+	Ping(ctx context.Context) error
+
 	// Durability (snapshot-backed stores only; no-op otherwise).
 	Flush(ctx context.Context) error
 	PersistenceEnabled() bool
