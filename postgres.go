@@ -43,6 +43,10 @@ func newPostgresStore(ctx context.Context, dsn string) (Store, error) {
 
 func (s *postgresStore) Close() error { s.pool.Close(); return nil }
 
+// Ping round-trips to the database so /v1/health reflects real connectivity
+// (pool exhaustion, a dropped primary, etc.).
+func (s *postgresStore) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
+
 // migrate creates the schema (idempotent — safe to run on every boot and from
 // every instance).
 func (s *postgresStore) migrate(ctx context.Context) error {

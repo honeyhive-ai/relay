@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,7 +20,27 @@ const (
 	defaultPairTTL = 600
 	maxPairTTL     = 3600
 	maxPairPayload = 8192
+
+	// resolvePairing is attempt-capped per client so the short code space can't
+	// be enumerated: more than maxResolveFailures misses inside resolveWindow
+	// from one client → 429 until the window rolls over.
+	maxResolveFailures = 10
+	resolveWindow      = time.Minute
 )
+
+// maxRequestBodyBytes bounds every JSON request body (env HIVE_RELAY_MAX_BODY_BYTES,
+// default 4 MiB) to stop multi-GB uploads from exhausting memory.
+var maxRequestBodyBytes = bodyCapFromEnv()
+
+func bodyCapFromEnv() int64 {
+	const def = 4 << 20 // 4 MiB
+	if v := os.Getenv("HIVE_RELAY_MAX_BODY_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
 
 // Options configure a Server. Only Store is required; the rest default to the
 // open-relay behavior. Downstream builds may inject implementations of the seams
@@ -46,13 +68,20 @@ type Server struct {
 	// (a live api.github.com call); tests override it.
 	verify func(ctx context.Context, token string) (*githubUser, error)
 
-	pairMu   sync.Mutex
-	pairings map[string]pairing
+	pairMu       sync.Mutex
+	pairings     map[string]pairing
+	pairAttempts map[string]*pairAttempt // client → recent failed-resolve window
 }
 
 type pairing struct {
 	payload   string
 	expiresAt time.Time
+}
+
+// pairAttempt tracks a client's failed pairing-code guesses inside one window.
+type pairAttempt struct {
+	failures int
+	resetAt  time.Time
 }
 
 // New builds a Server from Options, filling in open-relay defaults.
@@ -61,14 +90,15 @@ func New(o Options) *Server {
 		o.Entitlement = EntitlementFromEnv()
 	}
 	s := &Server{
-		store:       o.Store,
-		entitlement: o.Entitlement,
-		guard:       o.WriteGuard,
-		hooks:       o.Hooks,
-		adminAuth:   o.AdminAuth,
-		friendCap:   o.FriendCap,
-		httpClient:  &http.Client{Timeout: 10 * time.Second},
-		pairings:    map[string]pairing{},
+		store:        o.Store,
+		entitlement:  o.Entitlement,
+		guard:        o.WriteGuard,
+		hooks:        o.Hooks,
+		adminAuth:    o.AdminAuth,
+		friendCap:    o.FriendCap,
+		httpClient:   &http.Client{Timeout: 10 * time.Second},
+		pairings:     map[string]pairing{},
+		pairAttempts: map[string]*pairAttempt{},
 	}
 	s.verify = s.verifyGitHub
 	return s
@@ -92,10 +122,7 @@ func (s *Server) Handler() http.Handler {
 
 	// Public landing page at the exact root, and the health check.
 	mux.HandleFunc("GET /{$}", s.statusPage)
-	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte("ok"))
-	})
+	mux.HandleFunc("GET /v1/health", s.health)
 
 	mux.HandleFunc("POST /v1/workspaces/{id}/envelopes", s.postEnvelope)
 	mux.HandleFunc("GET /v1/workspaces/{id}/envelopes", s.listEnvelopes)
@@ -179,6 +206,20 @@ func (s *Server) afterWorkspaceWrite(ctx context.Context, workspace string, seq 
 	if s.hooks != nil {
 		s.hooks.WorkspaceWritten(ctx, workspace, seq, claimsFrom(ctx))
 	}
+}
+
+// health is the liveness/readiness probe. It actually round-trips the store
+// (not just "return ok") so an orchestrator pulls a wedged or disconnected
+// backend out of rotation: 200 "ok" when the store answers, 503 otherwise.
+func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := s.store.Ping(ctx); err != nil {
+		http.Error(w, "store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	_, _ = w.Write([]byte("ok"))
 }
 
 // ── Workspace sync handlers ───────────────────────────────────────────────────
@@ -331,10 +372,23 @@ func (s *Server) createPairing(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) resolvePairing(w http.ResponseWriter, r *http.Request) {
 	code := normalizePairCode(r.PathValue("code"))
+	client := clientIP(r)
+	now := time.Now()
+
 	s.pairMu.Lock()
 	s.prunePairings()
+	s.prunePairAttempts(now)
+	if s.resolveBlockedLocked(client, now) {
+		s.pairMu.Unlock()
+		http.Error(w, "too many attempts", http.StatusTooManyRequests)
+		return
+	}
 	p, ok := s.pairings[code]
+	if !ok {
+		s.noteResolveFailureLocked(client, now)
+	}
 	s.pairMu.Unlock()
+
 	if !ok {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -350,6 +404,44 @@ func (s *Server) prunePairings() {
 			delete(s.pairings, code)
 		}
 	}
+}
+
+// prunePairAttempts drops clients whose failure window has rolled over, so the
+// attempt map can't grow without bound. Caller holds pairMu.
+func (s *Server) prunePairAttempts(now time.Time) {
+	for client, a := range s.pairAttempts {
+		if now.After(a.resetAt) {
+			delete(s.pairAttempts, client)
+		}
+	}
+}
+
+// resolveBlockedLocked reports whether client has exhausted its resolve budget
+// for the current window. Caller holds pairMu.
+func (s *Server) resolveBlockedLocked(client string, now time.Time) bool {
+	a := s.pairAttempts[client]
+	return a != nil && !now.After(a.resetAt) && a.failures >= maxResolveFailures
+}
+
+// noteResolveFailureLocked records one failed guess for client, opening a fresh
+// window if none is active. Caller holds pairMu.
+func (s *Server) noteResolveFailureLocked(client string, now time.Time) {
+	a := s.pairAttempts[client]
+	if a == nil || now.After(a.resetAt) {
+		a = &pairAttempt{resetAt: now.Add(resolveWindow)}
+		s.pairAttempts[client] = a
+	}
+	a.failures++
+}
+
+// clientIP is the caller's IP (host without port), used as the pairing
+// rate-limit key. Behind a reverse proxy this is the proxy's address; operators
+// terminating TLS upstream should ensure per-client isolation there if needed.
+func clientIP(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
 }
 
 // ── Identity directory handlers ───────────────────────────────────────────────
@@ -722,9 +814,17 @@ func nonEmpty(s *string) *string {
 
 func okResp() map[string]bool { return map[string]bool{"ok": true} }
 
-// readJSON decodes the request body; on failure it writes 400 and returns false.
+// readJSON decodes the request body, capping it at maxRequestBodyBytes so a
+// hostile client can't stream a multi-GB body to exhaust memory. Over the cap →
+// 413; malformed JSON → 400; either writes the response and returns false.
 func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return false
+		}
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return false
 	}

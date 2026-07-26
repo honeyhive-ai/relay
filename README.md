@@ -38,6 +38,9 @@ hive-relay issue --key <priv-hex> --sub <id> --plan team --exp-days 365 \
 | `HIVE_RELAY_TOKEN_PUBKEY` | Ed25519 public key → require **signed** entitlement tokens |
 | `HIVE_RELAY_ACCESS_TOKENS` | comma-separated static allowlist (coarse gate) |
 | `HIVE_RELAY_FRIEND_CAP` | max accepted friends per account |
+| `HIVE_RELAY_MAX_ENVELOPES` | per-workspace retained-envelope cap for the memory store (default `50000`; `0` = unbounded) |
+| `HIVE_RELAY_RETENTION_DAYS` | prune memory-store envelopes older than N days (default `0` = age pruning off) |
+| `HIVE_RELAY_MAX_BODY_BYTES` | max JSON request-body size in bytes (default `4194304` = 4 MiB) |
 
 Storage selection: `DATABASE_URL` → Postgres; else `HIVE_RELAY_DATA_DIR` →
 memory+snapshot; else in-memory only.
@@ -93,6 +96,23 @@ relay.example.com {
 - **HA / multiple instances:** set `DATABASE_URL` to a shared Postgres — it takes
   precedence over the snapshot dir, so every instance shares state (no migration).
 
+#### Envelope retention (memory store)
+
+The in-memory / snapshot store bounds how many envelopes it keeps per workspace
+so a long-running self-host doesn't grow without limit and eventually OOM. By
+default each workspace retains its newest `HIVE_RELAY_MAX_ENVELOPES` (50 000)
+envelopes; set `HIVE_RELAY_RETENTION_DAYS` to also drop envelopes older than N
+days. Set either to `0` to disable that bound (`0` for both = unbounded, the old
+behavior).
+
+**Tradeoff (vs. offline catch-up):** clients sync by fetching everything after a
+cursor (`?after=seq`). The relay is a cache of *recent* E2EE traffic, not the
+source of truth — pruning below a cursor means a device offline longer than the
+retention window can't replay the gap from the relay and must re-sync from a peer
+that still holds history. Size the bounds above your expected offline window. For
+unbounded, always-catch-up history, use the Postgres backend (disk-bound, not
+retained in RAM) instead.
+
 ### Optional access gating
 
 Open by default (self-host — the URL isn't a secret). To gate:
@@ -124,7 +144,9 @@ once at creation.
 
 `GET /` serves a small public HTML status page ("Hive relay · online") so a
 human who opens the URL sees an intentional page rather than a `401`. `GET
-/v1/health` returns `ok`. Everything else is token-gated.
+/v1/health` round-trips the store and returns `200 ok`, or `503` if the backend
+is unreachable — wire it to your orchestrator's liveness/readiness probe.
+Everything else is token-gated.
 
 ## Extending (seams)
 

@@ -4,9 +4,33 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
+)
+
+// Envelope retention bounds the in-memory (and thus snapshot) envelope log so a
+// long-lived self-host doesn't grow without limit and eventually OOM. Two knobs,
+// both prune the OLDEST envelopes of a workspace:
+//
+//   - HIVE_RELAY_MAX_ENVELOPES — hard cap on retained envelopes per workspace
+//     (0 = unlimited). This is the primary memory bound and is on by default.
+//   - HIVE_RELAY_RETENTION_DAYS — age cap; envelopes older than N days are pruned
+//     (0 = disabled, the default).
+//
+// Tradeoff: a client fetches everything after its cursor (?after=seq). Pruning
+// below a cursor means a device offline longer than the retention window can't
+// replay the gap from the relay — it must re-sync from a peer that still holds
+// history (the relay is a cache of recent E2EE traffic, not the source of
+// truth). Size the bounds above your expected offline window. Pruning never
+// touches an envelope a still-connected client is about to fetch under normal
+// operation; it only drops the tail beyond the configured horizon.
+const (
+	defaultRetentionMaxEnvelopes = 50000 // per workspace; ~sane default memory bound
+	defaultRetentionDays         = 0     // age-based pruning off unless configured
 )
 
 // memoryStore is the in-process Store: RWMutex-guarded maps plus an optional
@@ -29,6 +53,10 @@ type memoryStore struct {
 	nextIDSeq uint64                 // monotonic id source for users/tokens
 
 	persistPath string // "" = in-memory only
+
+	// Envelope retention bounds (see the retention doc above). 0 = unbounded.
+	retentionMaxEnvelopes int
+	retentionMaxAge       time.Duration
 }
 
 type memToken struct {
@@ -37,7 +65,12 @@ type memToken struct {
 }
 
 type memWorkspace struct {
-	envelopes  []Envelope
+	envelopes []Envelope
+	// envAt[i] is the wall-clock unix time envelopes[i] was appended, kept
+	// aligned with envelopes for age-based retention. It never rides the wire
+	// (the relay is content-blind); it is persisted only so retention survives a
+	// restart.
+	envAt      []int64
 	nextSeq    uint64
 	candidates map[string]json.RawMessage
 	presence   map[string]json.RawMessage
@@ -59,17 +92,38 @@ type memAccount struct {
 }
 
 func newMemoryStore() *memoryStore {
+	maxEnv, maxAge := retentionFromEnv()
 	return &memoryStore{
-		workspaces:  map[string]*memWorkspace{},
-		directory:   map[string]*DirAccount{},
-		accounts:    map[string]*memAccount{},
-		loginIndex:  map[string]string{},
-		friendReqs:  map[string]*FriendRequest{},
-		friendEdges: map[[2]string]struct{}{},
-		users:       map[string]*UserRecord{},
-		tokens:      map[string]*memToken{},
-		tokenHash:   map[string]string{},
+		workspaces:            map[string]*memWorkspace{},
+		directory:             map[string]*DirAccount{},
+		accounts:              map[string]*memAccount{},
+		loginIndex:            map[string]string{},
+		friendReqs:            map[string]*FriendRequest{},
+		friendEdges:           map[[2]string]struct{}{},
+		users:                 map[string]*UserRecord{},
+		tokens:                map[string]*memToken{},
+		tokenHash:             map[string]string{},
+		retentionMaxEnvelopes: maxEnv,
+		retentionMaxAge:       maxAge,
 	}
+}
+
+// retentionFromEnv resolves the envelope-retention bounds from the environment,
+// falling back to the documented defaults.
+func retentionFromEnv() (maxEnvelopes int, maxAge time.Duration) {
+	maxEnvelopes = defaultRetentionMaxEnvelopes
+	if v := os.Getenv("HIVE_RELAY_MAX_ENVELOPES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			maxEnvelopes = n
+		}
+	}
+	days := defaultRetentionDays
+	if v := os.Getenv("HIVE_RELAY_RETENTION_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			days = n
+		}
+	}
+	return maxEnvelopes, time.Duration(days) * 24 * time.Hour
 }
 
 func (s *memoryStore) workspace(id string) *memWorkspace {
@@ -101,7 +155,38 @@ func (s *memoryStore) AppendEnvelope(_ context.Context, workspace string, body j
 	w := s.workspace(workspace)
 	w.nextSeq++
 	w.envelopes = append(w.envelopes, Envelope{Seq: w.nextSeq, Body: body})
+	w.envAt = append(w.envAt, time.Now().Unix())
+	s.pruneEnvelopesLocked(w, time.Now().Unix())
 	return w.nextSeq, nil
+}
+
+// pruneEnvelopesLocked drops the oldest envelopes of w that fall outside the
+// configured retention bounds (age first, then the hard count cap). It
+// reallocates the retained tail so the pruned prefix's backing array can be
+// collected rather than pinned forever. Caller holds s.mu.
+func (s *memoryStore) pruneEnvelopesLocked(w *memWorkspace, now int64) {
+	drop := 0
+	if s.retentionMaxAge > 0 {
+		cutoff := now - int64(s.retentionMaxAge/time.Second)
+		for drop < len(w.envAt) && w.envAt[drop] < cutoff {
+			drop++
+		}
+	}
+	if s.retentionMaxEnvelopes > 0 {
+		if over := (len(w.envelopes) - drop) - s.retentionMaxEnvelopes; over > 0 {
+			drop += over
+		}
+	}
+	if drop <= 0 {
+		return
+	}
+	if drop >= len(w.envelopes) {
+		w.envelopes = nil
+		w.envAt = nil
+		return
+	}
+	w.envelopes = append([]Envelope(nil), w.envelopes[drop:]...)
+	w.envAt = append([]int64(nil), w.envAt[drop:]...)
 }
 
 func (s *memoryStore) EnvelopesAfter(_ context.Context, workspace string, after uint64) ([]Envelope, error) {
@@ -512,6 +597,14 @@ func (s *memoryStore) FriendPresence(_ context.Context, account string, now int6
 		})
 	}
 	return out, nil
+}
+
+// Ping always succeeds: the in-process store is reachable whenever the process
+// is. It still takes the lock so the probe fails fast if the store is wedged.
+func (s *memoryStore) Ping(_ context.Context) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return nil
 }
 
 func (s *memoryStore) PersistenceEnabled() bool { return s.persistPath != "" }
