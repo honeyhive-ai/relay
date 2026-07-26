@@ -16,7 +16,7 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	req, _ := s.CreateFriendRequest(bg, a, "alice", b, "bob", 1, nil)
 	_, _ = s.AcceptFriendRequest(bg, req.ID, b, nil)
 	_, _ = s.PushAccountEvent(bg, a, raw(`{"kind":"ping"}`))
-	_, _ = s.AppendEnvelope(bg, "ws1", raw(`{"ct":"opaque"}`))
+	_, _ = s.AppendEnvelope(bg, "ws1", raw(`{"ct":"opaque"}`), "")
 	if err := s.Flush(bg); err != nil {
 		t.Fatal(err)
 	}

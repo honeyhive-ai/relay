@@ -70,7 +70,15 @@ type memWorkspace struct {
 	// aligned with envelopes for age-based retention. It never rides the wire
 	// (the relay is content-blind); it is persisted only so retention survives a
 	// restart.
-	envAt      []int64
+	envAt []int64
+	// envKey[i] is the idempotency key envelopes[i] was stored under ("" = none),
+	// kept aligned with envelopes so pruning can forget a dropped envelope's key.
+	envKey []string
+	// dedup maps a non-empty idempotency key → the seq stored under it, so a
+	// re-push returns the existing seq instead of appending a duplicate. Rebuilt
+	// from envKey on snapshot restore; an entry is dropped when its envelope is
+	// pruned (forgetting a pruned key is acceptable — a later re-push re-appends).
+	dedup      map[string]uint64
 	nextSeq    uint64
 	candidates map[string]json.RawMessage
 	presence   map[string]json.RawMessage
@@ -149,15 +157,34 @@ func (s *memoryStore) account(key string) *memAccount {
 
 // ── Workspace sync ───────────────────────────────────────────────────────────
 
-func (s *memoryStore) AppendEnvelope(_ context.Context, workspace string, body json.RawMessage) (uint64, error) {
+func (s *memoryStore) AppendEnvelope(_ context.Context, workspace string, body json.RawMessage, dedupKey string) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	w := s.workspace(workspace)
+	// Realign envKey with envelopes in case envelopes were populated directly
+	// (older snapshots without keys, or tests): pad the older prefix with empty
+	// keys so the append below stays index-aligned.
+	if len(w.envKey) < len(w.envelopes) {
+		w.envKey = append(make([]string, len(w.envelopes)-len(w.envKey)), w.envKey...)
+	}
+	if dedupKey != "" {
+		if seq, ok := w.dedup[dedupKey]; ok {
+			return seq, nil // already stored — idempotent no-op
+		}
+	}
 	w.nextSeq++
-	w.envelopes = append(w.envelopes, Envelope{Seq: w.nextSeq, Body: body})
+	seq := w.nextSeq
+	w.envelopes = append(w.envelopes, Envelope{Seq: seq, Body: body})
 	w.envAt = append(w.envAt, time.Now().Unix())
+	w.envKey = append(w.envKey, dedupKey)
+	if dedupKey != "" {
+		if w.dedup == nil {
+			w.dedup = map[string]uint64{}
+		}
+		w.dedup[dedupKey] = seq
+	}
 	s.pruneEnvelopesLocked(w, time.Now().Unix())
-	return w.nextSeq, nil
+	return seq, nil
 }
 
 // pruneEnvelopesLocked drops the oldest envelopes of w that fall outside the
@@ -180,13 +207,22 @@ func (s *memoryStore) pruneEnvelopesLocked(w *memWorkspace, now int64) {
 	if drop <= 0 {
 		return
 	}
+	// Forget the idempotency keys of the envelopes being dropped (a re-push of a
+	// pruned envelope re-appends — the relay is a cache of recent traffic).
+	for i := 0; i < drop && i < len(w.envKey); i++ {
+		if k := w.envKey[i]; k != "" {
+			delete(w.dedup, k)
+		}
+	}
 	if drop >= len(w.envelopes) {
 		w.envelopes = nil
 		w.envAt = nil
+		w.envKey = nil
 		return
 	}
 	w.envelopes = append([]Envelope(nil), w.envelopes[drop:]...)
 	w.envAt = append([]int64(nil), w.envAt[drop:]...)
+	w.envKey = append([]string(nil), w.envKey[drop:]...)
 }
 
 func (s *memoryStore) EnvelopesAfter(_ context.Context, workspace string, after uint64) ([]Envelope, error) {

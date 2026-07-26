@@ -42,7 +42,12 @@ type wsSnap struct {
 	// a restart. Omitted by (and absent from) older snapshots; on load a missing
 	// or mismatched-length EnvAt is backfilled to "now" so pre-existing history
 	// isn't age-pruned on the first boot after upgrade.
-	EnvAt      []int64                    `json:"envAt,omitempty"`
+	EnvAt []int64 `json:"envAt,omitempty"`
+	// EnvKey carries the per-envelope idempotency keys so push dedup survives a
+	// restart (a client re-pushing after a restart must not duplicate the log).
+	// Absent from older snapshots; a missing/mismatched-length EnvKey is backfilled
+	// to empty keys on load (those envelopes simply won't dedup a future re-push).
+	EnvKey     []string                   `json:"envKey,omitempty"`
 	NextSeq    uint64                     `json:"nextSeq"`
 	Candidates map[string]json.RawMessage `json:"candidates"`
 	Presence   map[string]json.RawMessage `json:"presence"`
@@ -121,9 +126,23 @@ func (s *memoryStore) restore(snap snapshot) {
 				envAt[i] = now
 			}
 		}
+		envKey := w.EnvKey
+		if len(envKey) != len(w.Envelopes) {
+			// Older snapshot (no keys) or a length mismatch: no dedup keys for
+			// pre-existing history.
+			envKey = make([]string, len(w.Envelopes))
+		}
+		dedup := map[string]uint64{}
+		for i, k := range envKey {
+			if k != "" {
+				dedup[k] = w.Envelopes[i].Seq
+			}
+		}
 		ws := &memWorkspace{
 			envelopes:  w.Envelopes,
 			envAt:      envAt,
+			envKey:     envKey,
+			dedup:      dedup,
 			nextSeq:    w.NextSeq,
 			candidates: cand,
 			presence:   pres,
@@ -211,7 +230,7 @@ func (s *memoryStore) toSnapshot() snapshot {
 	}
 	for id, w := range s.workspaces {
 		snap.Workspaces[id] = wsSnap{
-			Envelopes: w.envelopes, EnvAt: w.envAt, NextSeq: w.nextSeq,
+			Envelopes: w.envelopes, EnvAt: w.envAt, EnvKey: w.envKey, NextSeq: w.nextSeq,
 			Candidates: w.candidates, Presence: w.presence, Keyring: w.keyring,
 		}
 	}

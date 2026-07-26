@@ -39,7 +39,7 @@ func pgStore(t *testing.T) *postgresStore {
 func TestPG_EnvelopeSeqMonotonicAndCursor(t *testing.T) {
 	s := pgStore(t)
 	for want := uint64(1); want <= 3; want++ {
-		got, err := s.AppendEnvelope(bg, "ws1", raw(`{"ct":"x"}`))
+		got, err := s.AppendEnvelope(bg, "ws1", raw(`{"ct":"x"}`), "")
 		if err != nil || got != want {
 			t.Fatalf("append: got %d want %d err %v", got, want, err)
 		}
@@ -49,8 +49,48 @@ func TestPG_EnvelopeSeqMonotonicAndCursor(t *testing.T) {
 		t.Fatalf("after=1: %+v", rows)
 	}
 	// Distinct workspace has its own sequence.
-	if got, _ := s.AppendEnvelope(bg, "ws2", raw(`{}`)); got != 1 {
+	if got, _ := s.AppendEnvelope(bg, "ws2", raw(`{}`), ""); got != 1 {
 		t.Fatalf("ws2 seq should restart at 1, got %d", got)
+	}
+}
+
+func TestPG_EnvelopeDedupByKey(t *testing.T) {
+	s := pgStore(t)
+	body := raw(`{"ciphertext":"AAAA"}`)
+	key := "sha256:deadbeef"
+
+	seq1, err := s.AppendEnvelope(bg, "ws1", body, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Re-push: same key → same seq, no second row.
+	seq2, err := s.AppendEnvelope(bg, "ws1", body, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq1 != seq2 {
+		t.Fatalf("re-push seq mismatch: %d vs %d", seq1, seq2)
+	}
+	if rows, _ := s.EnvelopesAfter(bg, "ws1", 0); len(rows) != 1 {
+		t.Fatalf("re-push must store one row, got %d", len(rows))
+	}
+	// Distinct key appends.
+	if _, err := s.AppendEnvelope(bg, "ws1", raw(`{"ciphertext":"BBBB"}`), "sha256:feed"); err != nil {
+		t.Fatal(err)
+	}
+	if rows, _ := s.EnvelopesAfter(bg, "ws1", 0); len(rows) != 2 {
+		t.Fatalf("distinct key should append, got %d rows", len(rows))
+	}
+	// Empty key disables dedup — identical bodies both append (NULL keys are
+	// exempt from the unique index).
+	if _, err := s.AppendEnvelope(bg, "ws2", body, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendEnvelope(bg, "ws2", body, ""); err != nil {
+		t.Fatal(err)
+	}
+	if rows, _ := s.EnvelopesAfter(bg, "ws2", 0); len(rows) != 2 {
+		t.Fatalf("empty key should not dedup, got %d rows", len(rows))
 	}
 }
 

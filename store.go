@@ -206,7 +206,13 @@ func mustJSON(v any) json.RawMessage {
 // store stays free of policy.
 type Store interface {
 	// Workspace sync (opaque envelopes + rendezvous + key rotations).
-	AppendEnvelope(ctx context.Context, workspace string, body json.RawMessage) (uint64, error)
+	//
+	// AppendEnvelope is idempotent on a non-empty dedupKey: a re-push carrying a
+	// key already stored for this workspace is NOT appended a second time — the
+	// existing seq is returned. An empty dedupKey disables dedup (always appends),
+	// preserving the historical behavior. The key is opaque to the relay (a hash
+	// of the sealed body or a client-supplied id), so content-blindness holds.
+	AppendEnvelope(ctx context.Context, workspace string, body json.RawMessage, dedupKey string) (uint64, error)
 	EnvelopesAfter(ctx context.Context, workspace string, after uint64) ([]Envelope, error)
 	PutCandidate(ctx context.Context, workspace, deviceID string, candidate json.RawMessage) error
 	Candidates(ctx context.Context, workspace string) (map[string]json.RawMessage, error)
