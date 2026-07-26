@@ -66,8 +66,15 @@ CREATE TABLE IF NOT EXISTS relay_envelopes (
   workspace TEXT   NOT NULL,
   seq       BIGINT NOT NULL,
   body      TEXT   NOT NULL,
+  dedup_key TEXT,
   PRIMARY KEY (workspace, seq)
 );
+-- Idempotent push: at most one envelope per (workspace, dedup_key). NULL keys
+-- (dedup disabled) are exempt via the partial predicate, so un-keyed appends are
+-- never collapsed. ALTER backfills the column onto pre-existing deployments.
+ALTER TABLE relay_envelopes ADD COLUMN IF NOT EXISTS dedup_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS relay_envelopes_dedup
+  ON relay_envelopes (workspace, dedup_key) WHERE dedup_key IS NOT NULL;
 CREATE TABLE IF NOT EXISTS relay_candidates (
   workspace TEXT NOT NULL,
   device_id TEXT NOT NULL,
@@ -168,7 +175,16 @@ type pgxQuerier interface {
 
 // ── Workspace sync ───────────────────────────────────────────────────────────
 
-func (s *postgresStore) AppendEnvelope(ctx context.Context, workspace string, body json.RawMessage) (uint64, error) {
+func (s *postgresStore) AppendEnvelope(ctx context.Context, workspace string, body json.RawMessage, dedupKey string) (uint64, error) {
+	// Fast path: a re-push (e.g. after a client restart) carries an already-stored
+	// key — return the existing seq without consuming a sequence number.
+	if dedupKey != "" {
+		if seq, ok, err := s.envelopeSeqByKey(ctx, workspace, dedupKey); err != nil {
+			return 0, err
+		} else if ok {
+			return seq, nil
+		}
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
@@ -178,12 +194,41 @@ func (s *postgresStore) AppendEnvelope(ctx context.Context, workspace string, bo
 	if err != nil {
 		return 0, err
 	}
+	var keyArg any // NULL when dedup is disabled, so un-keyed appends never collide
+	if dedupKey != "" {
+		keyArg = dedupKey
+	}
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO relay_envelopes (workspace, seq, body) VALUES ($1, $2, $3)`,
-		workspace, seq, []byte(body)); err != nil {
+		`INSERT INTO relay_envelopes (workspace, seq, body, dedup_key) VALUES ($1, $2, $3, $4)`,
+		workspace, seq, []byte(body), keyArg); err != nil {
+		// Lost a concurrent race on the same dedup key: the unique index rejected
+		// us. Roll back (the deferred Rollback frees the consumed seq) and return
+		// the winner's seq, so the push stays idempotent under concurrency.
+		var pgErr *pgconn.PgError
+		if dedupKey != "" && errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			if existing, ok, e := s.envelopeSeqByKey(ctx, workspace, dedupKey); e == nil && ok {
+				return existing, nil
+			}
+		}
 		return 0, err
 	}
 	return seq, tx.Commit(ctx)
+}
+
+// envelopeSeqByKey returns the seq an envelope was stored under for a given
+// (workspace, dedupKey), or ok=false if none exists.
+func (s *postgresStore) envelopeSeqByKey(ctx context.Context, workspace, dedupKey string) (uint64, bool, error) {
+	var seq uint64
+	err := s.pool.QueryRow(ctx,
+		`SELECT seq FROM relay_envelopes WHERE workspace = $1 AND dedup_key = $2`,
+		workspace, dedupKey).Scan(&seq)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return seq, true, nil
 }
 
 func (s *postgresStore) EnvelopesAfter(ctx context.Context, workspace string, after uint64) ([]Envelope, error) {

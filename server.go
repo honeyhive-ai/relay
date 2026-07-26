@@ -2,6 +2,8 @@ package relay
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net"
@@ -233,12 +235,35 @@ func (s *Server) postEnvelope(w http.ResponseWriter, r *http.Request) {
 	if !s.enforceWrite(w, r, id) {
 		return
 	}
-	seq, err := s.store.AppendEnvelope(r.Context(), id, body)
+	seq, err := s.store.AppendEnvelope(r.Context(), id, body, dedupKeyFor(r, body))
 	if storeErr(w, err) {
 		return
 	}
 	s.afterWorkspaceWrite(r.Context(), id, seq)
 	writeJSON(w, http.StatusOK, map[string]uint64{"seq": seq})
+}
+
+// dedupKeyFor derives the idempotency key for an envelope push. It stays content-
+// blind (never inspects plaintext) and backward-compatible with existing clients:
+//
+//   - An explicit client-supplied id wins (Idempotency-Key, or the hive-native
+//     X-Hive-Event-Id), letting a client name the event directly.
+//   - Absent a header, we hash the opaque sealed body (sha256). A re-push resends
+//     byte-identical ciphertext, so the hash dedups it with no client change. Two
+//     genuinely-distinct events can't collide in practice: every sealed body
+//     carries a unique event id + random nonce inside the ciphertext the relay
+//     can't see, so distinct events always have distinct bytes.
+//
+// The result is opaque to the store — a hash or an id, never event content.
+func dedupKeyFor(r *http.Request, body json.RawMessage) string {
+	if k := strings.TrimSpace(r.Header.Get("Idempotency-Key")); k != "" {
+		return k
+	}
+	if k := strings.TrimSpace(r.Header.Get("X-Hive-Event-Id")); k != "" {
+		return k
+	}
+	sum := sha256.Sum256(body)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func (s *Server) listEnvelopes(w http.ResponseWriter, r *http.Request) {

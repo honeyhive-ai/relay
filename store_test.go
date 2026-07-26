@@ -23,7 +23,7 @@ func TestRetentionCountCapPrunesOldest(t *testing.T) {
 	s.retentionMaxEnvelopes = 3
 	s.retentionMaxAge = 0
 	for i := 0; i < 10; i++ {
-		if _, err := s.AppendEnvelope(bg, "ws", raw(`{"n":1}`)); err != nil {
+		if _, err := s.AppendEnvelope(bg, "ws", raw(`{"n":1}`), ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -37,7 +37,7 @@ func TestRetentionCountCapPrunesOldest(t *testing.T) {
 	}
 	// nextSeq keeps advancing — cursor semantics hold: a client at after=10 sees
 	// nothing, and pruning never rewinds the sequence.
-	if _, _ = s.AppendEnvelope(bg, "ws", raw(`{}`)); rows[2].Seq != 10 {
+	if _, _ = s.AppendEnvelope(bg, "ws", raw(`{}`), ""); rows[2].Seq != 10 {
 		t.Fatal("pruning must not rewind seq")
 	}
 	if rows, _ := s.EnvelopesAfter(bg, "ws", 11); len(rows) != 0 {
@@ -56,7 +56,7 @@ func TestRetentionAgePrunesStale(t *testing.T) {
 	w.envelopes = []Envelope{{Seq: 1, Body: raw(`{}`)}, {Seq: 2, Body: raw(`{}`)}}
 	w.envAt = []int64{old, old}
 	w.nextSeq = 2
-	if _, err := s.AppendEnvelope(bg, "ws", raw(`{}`)); err != nil {
+	if _, err := s.AppendEnvelope(bg, "ws", raw(`{}`), ""); err != nil {
 		t.Fatal(err)
 	}
 	rows, _ := s.EnvelopesAfter(bg, "ws", 0)
@@ -70,10 +70,81 @@ func TestRetentionDisabledKeepsAll(t *testing.T) {
 	s.retentionMaxEnvelopes = 0
 	s.retentionMaxAge = 0
 	for i := 0; i < 100; i++ {
-		_, _ = s.AppendEnvelope(bg, "ws", raw(`{}`))
+		_, _ = s.AppendEnvelope(bg, "ws", raw(`{}`), "")
 	}
 	if rows, _ := s.EnvelopesAfter(bg, "ws", 0); len(rows) != 100 {
 		t.Fatalf("unbounded retention should keep all 100, got %d", len(rows))
+	}
+}
+
+// ── Idempotent push dedup ──────────────────────────────────────────────────────
+
+func TestAppendEnvelopeDedupsByKey(t *testing.T) {
+	s := newMemoryStore()
+	body := raw(`{"ciphertext":"AAAA","nonce":"BBBB"}`)
+	key := "sha256:deadbeef"
+
+	seq1, err := s.AppendEnvelope(bg, "ws", body, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A re-push (same body → same key) must not append a second envelope and must
+	// return the original seq.
+	seq2, err := s.AppendEnvelope(bg, "ws", body, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq1 != seq2 {
+		t.Fatalf("re-push should return same seq: %d vs %d", seq1, seq2)
+	}
+	if rows, _ := s.EnvelopesAfter(bg, "ws", 0); len(rows) != 1 {
+		t.Fatalf("re-push must store exactly one envelope, got %d", len(rows))
+	}
+
+	// A distinct key still appends distinctly.
+	if _, err := s.AppendEnvelope(bg, "ws", raw(`{"ciphertext":"CCCC"}`), "sha256:feedface"); err != nil {
+		t.Fatal(err)
+	}
+	if rows, _ := s.EnvelopesAfter(bg, "ws", 0); len(rows) != 2 {
+		t.Fatalf("distinct key should append, got %d rows", len(rows))
+	}
+
+	// The key is scoped per workspace, so an identical body in another workspace
+	// is stored on its own.
+	if seq, _ := s.AppendEnvelope(bg, "ws2", body, key); seq != 1 {
+		t.Fatalf("dedup must be per-workspace; ws2 seq want 1 got %d", seq)
+	}
+
+	// An empty key disables dedup — identical bodies append every time.
+	for i := 0; i < 3; i++ {
+		if _, err := s.AppendEnvelope(bg, "ws3", body, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rows, _ := s.EnvelopesAfter(bg, "ws3", 0); len(rows) != 3 {
+		t.Fatalf("empty key should not dedup, got %d rows", len(rows))
+	}
+}
+
+func TestDedupForgottenAfterPrune(t *testing.T) {
+	s := newMemoryStore()
+	s.retentionMaxEnvelopes = 2
+	s.retentionMaxAge = 0
+	key := "sha256:aa"
+	if _, err := s.AppendEnvelope(bg, "ws", raw(`{"n":1}`), key); err != nil {
+		t.Fatal(err)
+	}
+	// Two more distinct envelopes prune the keyed one out of the window.
+	_, _ = s.AppendEnvelope(bg, "ws", raw(`{"n":2}`), "sha256:bb")
+	_, _ = s.AppendEnvelope(bg, "ws", raw(`{"n":3}`), "sha256:cc")
+	if _, ok := s.workspace("ws").dedup[key]; ok {
+		t.Fatal("a pruned envelope's dedup key must be forgotten")
+	}
+	// Re-pushing the pruned body re-appends (the relay is a cache of recent
+	// traffic, not the source of truth).
+	seq, _ := s.AppendEnvelope(bg, "ws", raw(`{"n":1}`), key)
+	if seq != 4 {
+		t.Fatalf("re-push of a pruned key should append anew, seq=%d", seq)
 	}
 }
 

@@ -112,6 +112,50 @@ func TestEnvelopePostAndList(t *testing.T) {
 	}
 }
 
+// TestEnvelopeRePushIsIdempotent covers the sync#2 fix: a client re-pushing the
+// same sealed body (e.g. after a restart) must not duplicate the relay log. This
+// needs NO client change — the relay content-hashes the opaque body — so it also
+// pins the backward-compatible wire contract.
+func TestEnvelopeRePushIsIdempotent(t *testing.T) {
+	ts := testServer(entitlementPolicy{kind: entOpen}, nil)
+	defer ts.Close()
+
+	push := func() uint64 {
+		resp, body := do(t, "POST", ts.URL+"/v1/workspaces/wsR/envelopes", "",
+			json.RawMessage(`{"ciphertext":"Zm9v","nonce":"YmFy","version":1}`))
+		if resp.StatusCode != 200 {
+			t.Fatalf("post: %d %s", resp.StatusCode, body)
+		}
+		var out struct {
+			Seq uint64 `json:"seq"`
+		}
+		_ = json.Unmarshal(body, &out)
+		return out.Seq
+	}
+	// Push the identical body three times (a re-push after restart resends the log).
+	s1, s2, s3 := push(), push(), push()
+	if s1 != s2 || s2 != s3 {
+		t.Fatalf("re-push must return the same seq, got %d/%d/%d", s1, s2, s3)
+	}
+	_, body := do(t, "GET", ts.URL+"/v1/workspaces/wsR/envelopes?after=0", "", nil)
+	var rows []Envelope
+	_ = json.Unmarshal(body, &rows)
+	if len(rows) != 1 {
+		t.Fatalf("re-push must not grow the log: want 1 envelope, got %d", len(rows))
+	}
+	// A genuinely different body still appends.
+	resp, _ := do(t, "POST", ts.URL+"/v1/workspaces/wsR/envelopes", "",
+		json.RawMessage(`{"ciphertext":"YmF6","nonce":"cXV4","version":1}`))
+	if resp.StatusCode != 200 {
+		t.Fatalf("distinct post: %d", resp.StatusCode)
+	}
+	_, body = do(t, "GET", ts.URL+"/v1/workspaces/wsR/envelopes?after=0", "", nil)
+	_ = json.Unmarshal(body, &rows)
+	if len(rows) != 2 {
+		t.Fatalf("distinct body should append: want 2, got %d", len(rows))
+	}
+}
+
 func TestPairingCreateAndResolve(t *testing.T) {
 	ts := testServer(entitlementPolicy{kind: entOpen}, nil)
 	defer ts.Close()
