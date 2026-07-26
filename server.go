@@ -37,8 +37,8 @@ type Options struct {
 type Server struct {
 	store       Store
 	entitlement EntitlementVerifier
-	guard       WriteGuard // nil = content-blind (no membership check)
-	hooks       Hooks      // nil = no-op
+	guard       WriteGuard      // nil = content-blind (no membership check)
+	hooks       Hooks           // nil = no-op
 	adminAuth   AdminAuthorizer // nil = admin API disabled
 	friendCap   *int
 	httpClient  *http.Client
