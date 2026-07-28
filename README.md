@@ -126,6 +126,25 @@ Open by default (self-host — the URL isn't a secret). To gate:
   revocation. Pair it with `StoreEntitlementVerifier` to make the store the
   access gate.
 
+Gating applies symmetrically to **reads and writes**: both `GET`
+(envelopes / keyring / presence / candidates) and `POST` on a workspace require
+the same entitlement (`enforceRead` mirrors `enforceWrite`). Under a token-gated
+policy an unauthenticated read is `401`; under the open policy reads stay open,
+just like writes. This is a coarse, content-blind token gate — it checks the
+presented entitlement, never the body — so workspace ciphertext + keyring are no
+longer readable by anyone who merely learns a workspace id. Clients already send
+their access token on every request, so no client change is needed.
+
+**Deferred (known, needs a product decision — not implemented here):**
+
+- *Per-member read authorization.* The token gate is coarse: any entitled caller
+  may read any workspace. Restricting *which member* may read *which workspace*
+  needs the enterprise membership seam (the read-side analogue of `WriteGuard`)
+  and is out of scope for the coarse gate.
+- *High-entropy workspace ids.* Clients today derive a workspace id from a
+  possibly-guessable room *name*. Making ids high-entropy (so an id can't be
+  guessed at all) is a client-side + invite-model change, not a relay change.
+
 ### User/token admin API (`/v1/admin/*`)
 
 The relay has a durable user + token store (both backends implement it) and a

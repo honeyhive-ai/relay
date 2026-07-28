@@ -288,6 +288,65 @@ func TestPairingResolveRateLimited(t *testing.T) {
 	}
 }
 
+// TestReadAuthorization closes the read half of S5: workspace *reads* must
+// require the same entitlement writes do. Under a token-gated (signed) policy an
+// unauthenticated GET of ciphertext (envelopes) or the keyring is rejected 401,
+// but the same GET with a valid token succeeds — the credential existing clients
+// already attach to every request. Health stays ungated, and the open policy
+// keeps reads open (self-host default), consistent with unconditional writes.
+func TestReadAuthorization(t *testing.T) {
+	sk := testKey(t)
+	policy := entitlementPolicy{kind: entSigned, pubkey: sk.Public().(ed25519.PublicKey)}
+	ts := testServer(policy, nil)
+	defer ts.Close()
+	tok := issueToken(sk, TokenClaims{Sub: "reader"})
+
+	get := func(path, bearer string) int {
+		req, _ := http.NewRequest("GET", ts.URL+path, nil)
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	for _, path := range []string{
+		"/v1/workspaces/ws1/envelopes?after=0",
+		"/v1/workspaces/ws1/keyring",
+		"/v1/workspaces/ws1/presence",
+		"/v1/workspaces/ws1/candidates",
+	} {
+		if code := get(path, ""); code != http.StatusUnauthorized {
+			t.Fatalf("unauthenticated read %s want 401, got %d", path, code)
+		}
+		if code := get(path, tok); code != http.StatusOK {
+			t.Fatalf("authenticated read %s want 200, got %d", path, code)
+		}
+	}
+
+	// Health is never gated.
+	if code := get("/v1/health", ""); code != http.StatusOK {
+		t.Fatalf("health should stay ungated, got %d", code)
+	}
+
+	// Open policy: reads stay open with no token, mirroring open writes.
+	open := testServer(entitlementPolicy{kind: entOpen}, nil)
+	defer open.Close()
+	req, _ := http.NewRequest("GET", open.URL+"/v1/workspaces/ws1/envelopes?after=0", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("open-policy read want 200, got %d", resp.StatusCode)
+	}
+}
+
 func TestSignedHandleParsesHexKey(t *testing.T) {
 	// Sanity: a hex pubkey from a generated key drives the signed policy.
 	_, priv, _ := ed25519.GenerateKey(nil)
