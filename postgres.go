@@ -22,6 +22,11 @@ import (
 // takes a row lock — correct under concurrency across instances.
 type postgresStore struct {
 	pool *pgxpool.Pool
+	// notify wakes this instance's SSE subscribers on a new append. In-process
+	// only: an append committed by another instance is NOT fanned out here —
+	// cross-instance push (Postgres LISTEN/NOTIFY) is the tracked follow-up
+	// (#151). Until then multi-instance clients keep their poll as the backstop.
+	notify *wsNotifier
 }
 
 func newPostgresStore(ctx context.Context, dsn string) (Store, error) {
@@ -33,7 +38,7 @@ func newPostgresStore(ctx context.Context, dsn string) (Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	s := &postgresStore{pool: pool}
+	s := &postgresStore{pool: pool, notify: newWSNotifier()}
 	if err := s.migrate(ctx); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -212,7 +217,27 @@ func (s *postgresStore) AppendEnvelope(ctx context.Context, workspace string, bo
 		}
 		return 0, err
 	}
-	return seq, tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	// Wake this instance's SSE subscribers. Only the genuinely-new path reaches
+	// here — the dedup fast-path and the 23505 race both return earlier — so a
+	// re-push never spams.
+	s.notify.publish(workspace, seq)
+	return seq, nil
+}
+
+// subscribeWorkspace / latestSeq satisfy notifyStore (see the memory store).
+func (s *postgresStore) subscribeWorkspace(workspace string) (<-chan uint64, func()) {
+	return s.notify.subscribe(workspace)
+}
+
+func (s *postgresStore) latestSeq(ctx context.Context, workspace string) (uint64, error) {
+	var seq uint64
+	err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(MAX(seq), 0) FROM relay_envelopes WHERE workspace = $1`,
+		workspace).Scan(&seq)
+	return seq, err
 }
 
 // envelopeSeqByKey returns the seq an envelope was stored under for a given

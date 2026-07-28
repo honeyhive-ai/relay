@@ -57,6 +57,10 @@ type memoryStore struct {
 	// Envelope retention bounds (see the retention doc above). 0 = unbounded.
 	retentionMaxEnvelopes int
 	retentionMaxAge       time.Duration
+
+	// notify wakes SSE subscribers of this workspace on a genuinely new append
+	// (in-process; see wsNotifier).
+	notify *wsNotifier
 }
 
 type memToken struct {
@@ -113,7 +117,23 @@ func newMemoryStore() *memoryStore {
 		tokenHash:             map[string]string{},
 		retentionMaxEnvelopes: maxEnv,
 		retentionMaxAge:       maxAge,
+		notify:                newWSNotifier(),
 	}
+}
+
+// subscribeWorkspace / latestSeq satisfy notifyStore, letting the SSE handler
+// wake on appends and greet a new subscriber with the current head seq.
+func (s *memoryStore) subscribeWorkspace(workspace string) (<-chan uint64, func()) {
+	return s.notify.subscribe(workspace)
+}
+
+func (s *memoryStore) latestSeq(_ context.Context, workspace string) (uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if w := s.workspaces[workspace]; w != nil {
+		return w.nextSeq, nil
+	}
+	return 0, nil
 }
 
 // retentionFromEnv resolves the envelope-retention bounds from the environment,
@@ -184,6 +204,10 @@ func (s *memoryStore) AppendEnvelope(_ context.Context, workspace string, body j
 		w.dedup[dedupKey] = seq
 	}
 	s.pruneEnvelopesLocked(w, time.Now().Unix())
+	// Wake SSE subscribers — only reached on a genuinely new seq (the dedup
+	// branch above returns first), so a re-push never spams. publish is
+	// non-blocking and takes a separate mutex, so holding s.mu here is safe.
+	s.notify.publish(workspace, seq)
 	return seq, nil
 }
 
