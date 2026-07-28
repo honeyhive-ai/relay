@@ -203,6 +203,27 @@ func (s *Server) enforceWrite(w http.ResponseWriter, r *http.Request, workspace 
 	return true
 }
 
+// enforceRead authorizes a workspace *read* (envelopes / keyring / presence /
+// candidates). It requires the same relay entitlement the write path requires:
+// under a token-gated policy (allowlist or signed hrt1) the caller must present
+// a valid token — exactly the credential existing clients already attach to
+// every GET — and under the open policy (self-host default) reads stay open,
+// mirroring content-blind write forwarding. The check is content-blind: it
+// inspects only the presented entitlement token, never the body.
+//
+// The top-level entitlement gate (see gate) already vets every /v1 route, so
+// this is the explicit, handler-level read-authorization point — closing S5's
+// read half by construction and guarding against a future router refactor that
+// might move a read off the gate. Returns false (after writing 401) when the
+// entitlement is missing or invalid.
+func (s *Server) enforceRead(w http.ResponseWriter, r *http.Request, workspace string) bool {
+	if _, ok := s.entitlement.Allow(bearerToken(r), nowUnix()); !ok {
+		http.Error(w, "relay requires a valid access token", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
 // afterWorkspaceWrite fires the optional metering/audit Hook.
 func (s *Server) afterWorkspaceWrite(ctx context.Context, workspace string, seq uint64) {
 	if s.hooks != nil {
@@ -267,6 +288,9 @@ func dedupKeyFor(r *http.Request, body json.RawMessage) string {
 }
 
 func (s *Server) listEnvelopes(w http.ResponseWriter, r *http.Request) {
+	if !s.enforceRead(w, r, r.PathValue("id")) {
+		return
+	}
 	rows, err := s.store.EnvelopesAfter(r.Context(), r.PathValue("id"), afterParam(r))
 	if storeErr(w, err) {
 		return
@@ -295,6 +319,9 @@ func (s *Server) publishCandidates(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listCandidates(w http.ResponseWriter, r *http.Request) {
+	if !s.enforceRead(w, r, r.PathValue("id")) {
+		return
+	}
 	m, err := s.store.Candidates(r.Context(), r.PathValue("id"))
 	if storeErr(w, err) {
 		return
@@ -318,6 +345,9 @@ func (s *Server) publishPresence(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listPresence(w http.ResponseWriter, r *http.Request) {
+	if !s.enforceRead(w, r, r.PathValue("id")) {
+		return
+	}
 	m, err := s.store.PresenceBlobs(r.Context(), r.PathValue("id"))
 	if storeErr(w, err) {
 		return
@@ -342,6 +372,9 @@ func (s *Server) publishKeyring(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listKeyring(w http.ResponseWriter, r *http.Request) {
+	if !s.enforceRead(w, r, r.PathValue("id")) {
+		return
+	}
 	rows, err := s.store.KeyRotations(r.Context(), r.PathValue("id"))
 	if storeErr(w, err) {
 		return
