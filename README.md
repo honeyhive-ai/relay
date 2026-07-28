@@ -113,6 +113,22 @@ that still holds history. Size the bounds above your expected offline window. Fo
 unbounded, always-catch-up history, use the Postgres backend (disk-bound, not
 retained in RAM) instead.
 
+### Live push (Server-Sent Events)
+
+`GET /v1/workspaces/{id}/events` (`Content-Type: text/event-stream`) lets a
+client wake instantly on new traffic instead of polling on a timer. It is a
+content-blind **nudge** channel — never envelope bodies:
+
+- on connect: `: connected` (a comment), then optionally `data: {"seq":<head>}`;
+- on every new envelope appended to the workspace: `data: {"seq":<newSeq>}` —
+  the client pulls with its own `?after=` cursor over `GET /envelopes`;
+- every ~25s idle: a `: keep-alive` comment to survive proxy idle timeouts.
+
+Read-authorized exactly like the other workspace reads (`enforceRead`). Fan-out
+is **single-instance / in-process** today; cross-instance push (Postgres
+`LISTEN/NOTIFY`) is tracked as a follow-up, and multi-instance deployments keep
+the `?after=` poll as the backstop.
+
 ### Optional access gating
 
 Open by default (self-host — the URL isn't a secret). To gate:

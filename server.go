@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -128,6 +130,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("POST /v1/workspaces/{id}/envelopes", s.postEnvelope)
 	mux.HandleFunc("GET /v1/workspaces/{id}/envelopes", s.listEnvelopes)
+	mux.HandleFunc("GET /v1/workspaces/{id}/events", s.streamEvents)
 	mux.HandleFunc("POST /v1/workspaces/{id}/candidates", s.publishCandidates)
 	mux.HandleFunc("GET /v1/workspaces/{id}/candidates", s.listCandidates)
 	mux.HandleFunc("POST /v1/workspaces/{id}/presence", s.publishPresence)
@@ -296,6 +299,88 @@ func (s *Server) listEnvelopes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rows)
+}
+
+// sseKeepAlive is the idle heartbeat interval. A comment line every ~25s keeps
+// proxies and load balancers from culling an otherwise-silent stream.
+const sseKeepAlive = 25 * time.Second
+
+// streamEvents is the Server-Sent Events push endpoint that replaces the 3s
+// poll (ROADMAP step 1). It is a content-blind *nudge* channel: on every new
+// envelope appended to this workspace it emits `data: {"seq":N}` so the client
+// wakes and pulls (over the existing GET /envelopes cursor). It never streams
+// envelope bodies — the relay stays content-blind.
+//
+// Read-authorized exactly like the other workspace reads (enforceRead), so
+// under a token-gated policy an unauthenticated connect is 401 and under the
+// open policy it stays open.
+func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.enforceRead(w, r, id) {
+		return
+	}
+
+	// CRITICAL: the global http.Server.WriteTimeout (30s) would sever this
+	// long-lived stream mid-flight. Clear the per-connection write (and read)
+	// deadline so only the client disconnect / request context ends it. This
+	// touches ONLY this connection — the server-wide timeouts that protect the
+	// poll/JSON routes are unchanged. (SetWriteDeadline is unsupported on some
+	// ResponseWriters, e.g. httptest.ResponseRecorder; ignore that error.)
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Time{})
+	_ = rc.SetReadDeadline(time.Time{})
+
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no") // ask nginx et al. not to buffer the stream
+	w.WriteHeader(http.StatusOK)
+
+	// Announce liveness immediately so the client knows the stream is open.
+	if _, err := io.WriteString(w, ": connected\n\n"); err != nil {
+		return
+	}
+	_ = rc.Flush()
+
+	// Subscribe before reading the head seq, so an append racing this setup is
+	// either counted in latestSeq or delivered on the channel (never lost).
+	var ch <-chan uint64
+	if ns, ok := s.store.(notifyStore); ok {
+		var unsubscribe func()
+		ch, unsubscribe = ns.subscribeWorkspace(id)
+		defer unsubscribe()
+		if seq, err := ns.latestSeq(r.Context(), id); err == nil {
+			if _, err := fmt.Fprintf(w, "data: {\"seq\":%d}\n\n", seq); err != nil {
+				return
+			}
+			_ = rc.Flush()
+		}
+	}
+
+	keepAlive := time.NewTicker(sseKeepAlive)
+	defer keepAlive.Stop()
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done(): // client disconnected — close cleanly
+			return
+		case seq := <-ch: // new append (ch is nil if the store can't notify → only keep-alives)
+			if _, err := fmt.Fprintf(w, "data: {\"seq\":%d}\n\n", seq); err != nil {
+				return
+			}
+			if err := rc.Flush(); err != nil {
+				return
+			}
+		case <-keepAlive.C:
+			if _, err := io.WriteString(w, ": keep-alive\n\n"); err != nil {
+				return
+			}
+			if err := rc.Flush(); err != nil {
+				return
+			}
+		}
+	}
 }
 
 type deviceBlobReq struct {
