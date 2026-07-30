@@ -8,7 +8,9 @@ app = "hive-relay"          # `fly launch` offers to pick a unique name
 primary_region = "iad"      # change to one near your users (e.g. lhr, fra, sjc)
 
 [build]
-  dockerfile = "Dockerfile"
+  # Resolved relative to this config's dir (deploy/); the Dockerfile lives at the
+  # repo root. Deploy from the repo root: `fly deploy . --config deploy/fly.toml`.
+  dockerfile = "../Dockerfile"
 
 [env]
   # In-memory + JSON snapshot on the volume below (single instance). For HA, set
