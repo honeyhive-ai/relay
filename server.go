@@ -75,6 +75,9 @@ type Server struct {
 	pairMu       sync.Mutex
 	pairings     map[string]pairing
 	pairAttempts map[string]*pairAttempt // client → recent failed-resolve window
+
+	pushLimiter *ipRateLimiter      // per-IP envelope-push rate limit
+	sseLimiter  *concurrencyLimiter // cap on concurrent SSE streams
 }
 
 type pairing struct {
@@ -103,6 +106,8 @@ func New(o Options) *Server {
 		httpClient:   &http.Client{Timeout: 10 * time.Second},
 		pairings:     map[string]pairing{},
 		pairAttempts: map[string]*pairAttempt{},
+		pushLimiter:  newIPRateLimiter(envFloat("HIVE_RELAY_PUSH_RATE", 100), envFloat("HIVE_RELAY_PUSH_BURST", 300)),
+		sseLimiter:   newConcurrencyLimiter(envInt64("HIVE_RELAY_MAX_SSE", 2000)),
 	}
 	s.verify = s.verifyGitHub
 	return s
@@ -253,6 +258,10 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 // ── Workspace sync handlers ───────────────────────────────────────────────────
 
 func (s *Server) postEnvelope(w http.ResponseWriter, r *http.Request) {
+	if !s.pushLimiter.allow(clientIP(r)) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
 	var body json.RawMessage
 	if !readJSON(w, r, &body) {
 		return
@@ -321,6 +330,15 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	if !s.enforceRead(w, r, id) {
 		return
 	}
+	// Cap concurrent streams so an attacker can't exhaust goroutines/FDs by
+	// opening SSE connections without bound. The slot is held for the stream's
+	// lifetime and released on return (client disconnect / context cancel).
+	release, ok := s.sseLimiter.acquire()
+	if !ok {
+		http.Error(w, "too many concurrent streams", http.StatusServiceUnavailable)
+		return
+	}
+	defer release()
 
 	// CRITICAL: the global http.Server.WriteTimeout (30s) would sever this
 	// long-lived stream mid-flight. Clear the per-connection write (and read)
@@ -583,6 +601,12 @@ func (s *Server) noteResolveFailureLocked(client string, now time.Time) {
 // rate-limit key. Behind a reverse proxy this is the proxy's address; operators
 // terminating TLS upstream should ensure per-client isolation there if needed.
 func clientIP(r *http.Request) string {
+	// Behind Fly's edge, RemoteAddr is the proxy IP (shared by all clients). Fly
+	// sets the real client IP here and strips any client-supplied copy, so it's
+	// trustworthy on Fly and absent off it — where we fall back to RemoteAddr.
+	if ip := r.Header.Get("Fly-Client-IP"); ip != "" {
+		return ip
+	}
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		return host
 	}

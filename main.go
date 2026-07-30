@@ -60,6 +60,12 @@ func Main() {
 		go flushLoop(store, stopFlush)
 	}
 
+	// Bound envelope growth on backends that don't prune inline (Postgres). The
+	// in-memory store already enforces the same caps at write time.
+	if pruner, ok := store.(envelopePruner); ok {
+		go pruneLoop(pruner, stopFlush)
+	}
+
 	addr := resolveAddr()
 	// Timeouts bound how long a single connection can tie up resources, which
 	// defends against Slowloris (trickled headers/body) and stuck peers. The
@@ -139,6 +145,34 @@ func flushLoop(store Store, stop <-chan struct{}) {
 		case <-tick.C:
 			if err := store.Flush(context.Background()); err != nil {
 				fmt.Fprintf(os.Stderr, "hive-relay: snapshot flush failed: %v\n", err)
+			}
+		}
+	}
+}
+
+// envelopePruner is implemented by backends whose envelope log needs periodic
+// pruning (Postgres). The in-memory store prunes inline at write time instead.
+type envelopePruner interface {
+	PruneEnvelopes(ctx context.Context, maxEnvelopes int, maxAge time.Duration) (int64, error)
+}
+
+func pruneLoop(pruner envelopePruner, stop <-chan struct{}) {
+	maxEnv, maxAge := retentionFromEnv()
+	if maxEnv <= 0 && maxAge <= 0 {
+		return // retention fully disabled
+	}
+	tick := time.NewTicker(time.Hour)
+	defer tick.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-tick.C:
+			n, err := pruner.PruneEnvelopes(context.Background(), maxEnv, maxAge)
+			if err != nil {
+				slog.Warn("envelope prune failed", "error", err)
+			} else if n > 0 {
+				slog.Info("pruned envelopes", "deleted", n)
 			}
 		}
 	}

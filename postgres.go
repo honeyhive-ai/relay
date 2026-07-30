@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -80,6 +81,9 @@ CREATE TABLE IF NOT EXISTS relay_envelopes (
 ALTER TABLE relay_envelopes ADD COLUMN IF NOT EXISTS dedup_key TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS relay_envelopes_dedup
   ON relay_envelopes (workspace, dedup_key) WHERE dedup_key IS NOT NULL;
+-- Insert time (unix seconds) so retention can prune by age. NULL on rows written
+-- before this column existed — age-pruning skips those; the count cap still bounds them.
+ALTER TABLE relay_envelopes ADD COLUMN IF NOT EXISTS created_at BIGINT;
 CREATE TABLE IF NOT EXISTS relay_candidates (
   workspace TEXT NOT NULL,
   device_id TEXT NOT NULL,
@@ -204,8 +208,8 @@ func (s *postgresStore) AppendEnvelope(ctx context.Context, workspace string, bo
 		keyArg = dedupKey
 	}
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO relay_envelopes (workspace, seq, body, dedup_key) VALUES ($1, $2, $3, $4)`,
-		workspace, seq, []byte(body), keyArg); err != nil {
+		`INSERT INTO relay_envelopes (workspace, seq, body, dedup_key, created_at) VALUES ($1, $2, $3, $4, $5)`,
+		workspace, seq, []byte(body), keyArg, time.Now().Unix()); err != nil {
 		// Lost a concurrent race on the same dedup key: the unique index rejected
 		// us. Roll back (the deferred Rollback frees the consumed seq) and return
 		// the winner's seq, so the push stays idempotent under concurrency.
@@ -225,6 +229,36 @@ func (s *postgresStore) AppendEnvelope(ctx context.Context, workspace string, bo
 	// re-push never spams.
 	s.notify.publish(workspace, seq)
 	return seq, nil
+}
+
+// PruneEnvelopes bounds the envelope table so it can't grow without limit: drop
+// rows older than maxAge (those with a created_at stamp), and keep at most
+// maxEnvelopes most-recent per workspace (by seq). A zero bound disables that
+// half. Returns the number of rows deleted. Safe to run periodically.
+func (s *postgresStore) PruneEnvelopes(ctx context.Context, maxEnvelopes int, maxAge time.Duration) (int64, error) {
+	var total int64
+	if maxAge > 0 {
+		cutoff := time.Now().Add(-maxAge).Unix()
+		ct, err := s.pool.Exec(ctx,
+			`DELETE FROM relay_envelopes WHERE created_at IS NOT NULL AND created_at < $1`, cutoff)
+		if err != nil {
+			return total, err
+		}
+		total += ct.RowsAffected()
+	}
+	if maxEnvelopes > 0 {
+		// Keep the top-N seqs per workspace; delete everything at or below the
+		// (max seq − N) floor.
+		ct, err := s.pool.Exec(ctx,
+			`DELETE FROM relay_envelopes e
+			 USING (SELECT workspace, MAX(seq) AS mx FROM relay_envelopes GROUP BY workspace) m
+			 WHERE e.workspace = m.workspace AND e.seq <= m.mx - $1`, int64(maxEnvelopes))
+		if err != nil {
+			return total, err
+		}
+		total += ct.RowsAffected()
+	}
+	return total, nil
 }
 
 // subscribeWorkspace / latestSeq satisfy notifyStore (see the memory store).
