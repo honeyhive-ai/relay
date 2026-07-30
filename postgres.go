@@ -48,9 +48,22 @@ func newPostgresStore(ctx context.Context, dsn string) (Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
-	if err := pool.Ping(ctx); err != nil {
+	// A managed cluster fronts primary + replica behind one load-balanced
+	// endpoint, so connections round-robin between them. Reads landing on a
+	// replica see none of the just-written envelopes (broken read-after-write).
+	// The DSN carries target_session_attrs=read-write so pgx keeps only
+	// primary connections; a connection that lands on a replica is rejected, so
+	// retry Ping here until boot pins a primary (rather than crash-looping).
+	var pingErr error
+	for i := 0; i < 20; i++ {
+		if pingErr = pool.Ping(ctx); pingErr == nil {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if pingErr != nil {
 		pool.Close()
-		return nil, fmt.Errorf("ping postgres: %w", err)
+		return nil, fmt.Errorf("ping postgres (no read-write node?): %w", pingErr)
 	}
 	s := &postgresStore{pool: pool, notify: newWSNotifier()}
 	if err := s.migrate(ctx); err != nil {
