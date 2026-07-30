@@ -123,10 +123,12 @@ func nowUnix() int64 { return time.Now().Unix() }
 // entitlement gate (a no-op when the policy is Open, i.e. self-hosted).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	m := newMetrics()
 
 	// Public landing page at the exact root, and the health check.
 	mux.HandleFunc("GET /{$}", s.statusPage)
 	mux.HandleFunc("GET /v1/health", s.health)
+	mux.HandleFunc("GET /metrics", m.handler)
 
 	mux.HandleFunc("POST /v1/workspaces/{id}/envelopes", s.postEnvelope)
 	mux.HandleFunc("GET /v1/workspaces/{id}/envelopes", s.listEnvelopes)
@@ -167,16 +169,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/admin/users/{id}/disabled", s.adminSetDisabled)
 	mux.HandleFunc("DELETE /v1/admin/tokens/{id}", s.adminRevokeToken)
 
-	return s.gate(mux)
+	return m.observe(s.gate(mux))
 }
 
 // gate rejects /v1/* (except health) unless the caller is entitled, and stashes
 // the verified claims in the request context for downstream enforcement.
 func (s *Server) gate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" || r.URL.Path == "/v1/health" || strings.HasPrefix(r.URL.Path, "/v1/admin/") {
-			// The status page + health are public; the admin API runs its own
-			// AdminAuthorizer (an operator credential, not a relay token).
+		if r.URL.Path == "/" || r.URL.Path == "/v1/health" || r.URL.Path == "/metrics" || strings.HasPrefix(r.URL.Path, "/v1/admin/") {
+			// The status page, health, and metrics are public; the admin API runs
+			// its own AdminAuthorizer (an operator credential, not a relay token).
 			next.ServeHTTP(w, r)
 			return
 		}

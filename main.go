@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,6 +27,9 @@ import (
 // $HIVE_RELAY_FRIEND_CAP (optional) caps accepted friends per account.
 
 func Main() {
+	// Structured JSON logs (request lines come from the observability middleware).
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+
 	args := os.Args[1:]
 	if len(args) > 0 {
 		switch args[0] {
