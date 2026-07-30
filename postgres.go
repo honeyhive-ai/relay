@@ -31,7 +31,16 @@ type postgresStore struct {
 }
 
 func newPostgresStore(ctx context.Context, dsn string) (Store, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse postgres dsn: %w", err)
+	}
+	// Fly Managed Postgres (and most hosted PG) front the database with a
+	// transaction-pooled PgBouncer, which is incompatible with server-side
+	// prepared statements. The simple query protocol never prepares, so it's safe
+	// behind any pooler; pgx does parameter substitution client-side.
+	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
