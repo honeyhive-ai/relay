@@ -44,16 +44,32 @@ func newPostgresStore(ctx context.Context, dsn string) (Store, error) {
 	// also pooler-safe but renders params as text and mis-handled the uint64
 	// `after` cursor, making `seq > $2` reads return nothing.)
 	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
+	// A managed cluster fronts primary + replica behind ONE load-balanced
+	// endpoint, so connections round-robin between them and reads landing on a
+	// replica see none of the just-written envelopes (broken read-after-write).
+	// libpq's target_session_attrs=read-write isn't reliably enforced against
+	// such a VIP, so reject replica connections definitively in code: any
+	// connection whose backend is in recovery (a standby) is refused, and
+	// pgxpool retries until it gets the primary. Keep a couple warm so steady
+	// state reuses primary connections without re-probing.
+	config.MinConns = 2
+	config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		var inRecovery bool
+		if err := conn.QueryRow(ctx, "SELECT pg_is_in_recovery()").Scan(&inRecovery); err != nil {
+			return err
+		}
+		if inRecovery {
+			return fmt.Errorf("connection landed on a read-only replica; retrying for primary")
+		}
+		return nil
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
-	// A managed cluster fronts primary + replica behind one load-balanced
-	// endpoint, so connections round-robin between them. Reads landing on a
-	// replica see none of the just-written envelopes (broken read-after-write).
-	// The DSN carries target_session_attrs=read-write so pgx keeps only
-	// primary connections; a connection that lands on a replica is rejected, so
-	// retry Ping here until boot pins a primary (rather than crash-looping).
+	// Retry until a Ping lands a primary connection (replica attempts are
+	// rejected by AfterConnect), so boot pins the primary rather than failing
+	// when the round-robin first hands out a standby.
 	var pingErr error
 	for i := 0; i < 20; i++ {
 		if pingErr = pool.Ping(ctx); pingErr == nil {
