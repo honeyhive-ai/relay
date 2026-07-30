@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"testing"
 
@@ -71,8 +72,18 @@ func TestPG_EnvelopeDedupByKey(t *testing.T) {
 	if seq1 != seq2 {
 		t.Fatalf("re-push seq mismatch: %d vs %d", seq1, seq2)
 	}
-	if rows, _ := s.EnvelopesAfter(bg, "ws1", 0); len(rows) != 1 {
+	rows, _ := s.EnvelopesAfter(bg, "ws1", 0)
+	if len(rows) != 1 {
 		t.Fatalf("re-push must store one row, got %d", len(rows))
+	}
+	// Body must round-trip byte-for-byte. A []byte bound to a TEXT column gets
+	// encoded as bytea (hex `\x…`), which reads back as invalid JSON — this
+	// asserts the string binding that prevents that silent corruption.
+	if got := string(rows[0].Body); got != string(body) {
+		t.Fatalf("body corrupted in round-trip: got %q want %q", got, string(body))
+	}
+	if !json.Valid(rows[0].Body) {
+		t.Fatalf("round-tripped body is not valid JSON: %q", string(rows[0].Body))
 	}
 	// Distinct key appends.
 	if _, err := s.AppendEnvelope(bg, "ws1", raw(`{"ciphertext":"BBBB"}`), "sha256:feed"); err != nil {

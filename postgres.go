@@ -250,8 +250,11 @@ func (s *postgresStore) AppendEnvelope(ctx context.Context, workspace string, bo
 		keyArg = dedupKey
 	}
 	if _, err := tx.Exec(ctx,
+		// body as a string (not []byte): pgx encodes []byte as bytea, which the
+		// TEXT column stores as a hex `\x…` literal — corrupting the JSON so reads
+		// deserialize to garbage. string encodes as text, round-tripping exactly.
 		`INSERT INTO relay_envelopes (workspace, seq, body, dedup_key, created_at) VALUES ($1, $2, $3, $4, $5)`,
-		workspace, seq, []byte(body), keyArg, time.Now().Unix()); err != nil {
+		workspace, seq, string(body), keyArg, time.Now().Unix()); err != nil {
 		// Lost a concurrent race on the same dedup key: the unique index rejected
 		// us. Roll back (the deferred Rollback frees the consumed seq) and return
 		// the winner's seq, so the push stays idempotent under concurrency.
@@ -357,7 +360,7 @@ func (s *postgresStore) PutCandidate(ctx context.Context, workspace, deviceID st
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO relay_candidates (workspace, device_id, blob) VALUES ($1, $2, $3)
 		 ON CONFLICT (workspace, device_id) DO UPDATE SET blob = EXCLUDED.blob`,
-		workspace, deviceID, []byte(candidate))
+		workspace, deviceID, string(candidate))
 	return err
 }
 
@@ -369,7 +372,7 @@ func (s *postgresStore) PutPresence(ctx context.Context, workspace, deviceID str
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO relay_presence (workspace, device_id, blob) VALUES ($1, $2, $3)
 		 ON CONFLICT (workspace, device_id) DO UPDATE SET blob = EXCLUDED.blob`,
-		workspace, deviceID, []byte(presence))
+		workspace, deviceID, string(presence))
 	return err
 }
 
@@ -398,7 +401,7 @@ func (s *postgresStore) deviceBlobs(ctx context.Context, table, workspace string
 
 func (s *postgresStore) AppendKeyRotation(ctx context.Context, workspace string, blob json.RawMessage) error {
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO relay_keyring (workspace, blob) VALUES ($1, $2)`, workspace, []byte(blob))
+		`INSERT INTO relay_keyring (workspace, blob) VALUES ($1, $2)`, workspace, string(blob))
 	return err
 }
 
@@ -537,7 +540,7 @@ func (s *postgresStore) PushAccountEvent(ctx context.Context, key string, body j
 	}
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO relay_inbox (account_key, seq, body) VALUES ($1, $2, $3)`,
-		key, seq, []byte(body)); err != nil {
+		key, seq, string(body)); err != nil {
 		return 0, err
 	}
 	return seq, tx.Commit(ctx)

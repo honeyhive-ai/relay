@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -1001,9 +1002,19 @@ func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	// Marshal before writing the status so a serialization failure becomes a
+	// visible 500 — not a silent empty 200. (Streaming Encode writes the header
+	// first, so an error mid-encode leaves a truncated body with a success code,
+	// which is exactly how a corrupted payload can masquerade as "empty".)
+	buf, err := json.Marshal(v)
+	if err != nil {
+		slog.Error("writeJSON: marshal failed", "error", err)
+		http.Error(w, `{"error":"internal encoding error"}`, http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(buf)
 }
 
 // storeErr writes 500 and returns true if a backend error occurred.
