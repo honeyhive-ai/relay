@@ -1,0 +1,45 @@
+# Continuous deploy to Fly.io. After `ci` passes on a push to main, deploy the
+# OPEN relay binary (cmd/hive-relay) to the hive-relay-enterprise Fly app — which
+# hosts the PUBLIC open relay and must only ever be deployed from this OSS repo.
+#
+# Requires the FLY_API_TOKEN repo secret (a deploy token):
+#   fly tokens create deploy -x 999999h
+#   -> honeyhive-ai/relay -> Settings -> Secrets and variables -> Actions -> FLY_API_TOKEN
+# Until that secret exists the deploy step skips cleanly (no failed run).
+#
+# Gated on `ci` (workflow_run) so a red build never deploys. `deploy/fly.toml`
+# names a placeholder app, so `--app hive-relay-enterprise` targets the real one;
+# the app's DATABASE_URL secret takes precedence over the volume, so the Postgres
+# store is used.
+name: deploy
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency: deploy-relay
+
+jobs:
+  deploy:
+    # Manual dispatch, or a green `ci` from a push to main.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Deploy (open relay -> hive-relay-enterprise)
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FLY_API_TOKEN:-}" ]; then
+            echo "FLY_API_TOKEN not set - skipping deploy (add the secret to enable auto-deploy)."
+            exit 0
+          fi
+          flyctl deploy --remote-only --app hive-relay-enterprise --config deploy/fly.toml
