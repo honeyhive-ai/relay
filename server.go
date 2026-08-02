@@ -157,6 +157,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/account/inbox", s.accountInbox)
 	mux.HandleFunc("GET /v1/account/devices", s.accountDevices)
 	mux.HandleFunc("POST /v1/account/visibility", s.accountVisibility)
+	mux.HandleFunc("POST /v1/account/invites", s.accountInviteCreate)
 
 	mux.HandleFunc("GET /v1/friends", s.friendsList)
 	mux.HandleFunc("GET /v1/friends/presence", s.friendsPresence)
@@ -719,6 +720,49 @@ func (s *Server) accountInbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rows)
+}
+
+// workspaceInviteBody delivers a client-sealed workspace invite to another
+// user's account inbox. `Invite` is opaque to the relay (the client seals the
+// `hivews1:` code — which carries the workspace key — to the recipient's
+// key-agreement key), so the relay stays content-blind: it only routes the
+// envelope to the target account, exactly like a friend request.
+type workspaceInviteBody struct {
+	ToLogin string          `json:"toLogin"`
+	Invite  json.RawMessage `json:"invite"`
+}
+
+func (s *Server) accountInviteCreate(w http.ResponseWriter, r *http.Request) {
+	var body workspaceInviteBody
+	if !readJSON(w, r, &body) {
+		return
+	}
+	user, _, ok := s.callerAccount(w, r)
+	if !ok {
+		return
+	}
+	toLogin := strings.TrimPrefix(strings.TrimSpace(body.ToLogin), "@")
+	if toLogin == "" || len(body.Invite) == 0 {
+		http.Error(w, "toLogin and invite are required", http.StatusBadRequest)
+		return
+	}
+	toAccount, found, err := s.store.AccountKeyForLogin(r.Context(), toLogin)
+	if storeErr(w, err) {
+		return
+	}
+	if !found {
+		http.Error(w, "user hasn't joined Hive", http.StatusNotFound)
+		return
+	}
+	event := mustJSON(map[string]any{
+		"kind":      "workspaceInvite",
+		"fromLogin": user.Login,
+		"invite":    body.Invite,
+	})
+	if _, err := s.store.PushAccountEvent(r.Context(), toAccount, event); storeErr(w, err) {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"state": "delivered"})
 }
 
 func (s *Server) accountDevices(w http.ResponseWriter, r *http.Request) {
