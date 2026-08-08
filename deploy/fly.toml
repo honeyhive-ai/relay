@@ -32,6 +32,14 @@ primary_region = "iad"      # change to one near your users (e.g. lhr, fra, sjc)
   auto_start_machines = true
   min_machines_running = 1  # snapshot store = single instance; use Postgres to scale out
 
+  # Per-machine connection concurrency limits: shed load (and trigger autoscaling
+  # where configured) before a single machine is buried. Generous for a poll/SSE
+  # relay; long-lived SSE streams are additionally capped in-process (HIVE_RELAY_MAX_SSE).
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 400
+    hard_limit = 500
+
 [[http_service.http_checks]]
   method = "get"
   path = "/v1/health"
@@ -41,4 +49,8 @@ primary_region = "iad"      # change to one near your users (e.g. lhr, fra, sjc)
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "256mb"
+  # 512MB headroom: the snapshot / in-memory store holds recent E2EE traffic + the
+  # social graph in RAM. The public prod app runs on Postgres (DATABASE_URL secret)
+  # and sets HIVE_RELAY_REQUIRE_DB=1 so it never silently falls back to the
+  # ephemeral in-memory store (see buildStore / deploy.yml).
+  memory = "512mb"

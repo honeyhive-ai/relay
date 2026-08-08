@@ -30,8 +30,18 @@ jobs:
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
+    # Approval gate (P2-22): configure the `production` environment under
+    # Settings -> Environments with required reviewers so a human approves each
+    # prod deploy of the public relay. (Creating the environment is a one-time
+    # repo-settings step; the job references it here.)
+    environment: production
     steps:
       - uses: actions/checkout@v4
+      # TODO(P2-22): pin this action to a verified full-length commit SHA instead
+      # of @master (a moving tag an upstream compromise could repoint), e.g.
+      # `superfly/flyctl-actions/setup-flyctl@<sha>  # v1.x`. Look up the SHA for a
+      # tagged release from the upstream repo and verify it before pinning — do NOT
+      # guess it.
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy (open relay -> hive-relay-enterprise)
         env:
@@ -42,4 +52,9 @@ jobs:
             echo "FLY_API_TOKEN not set - skipping deploy (add the secret to enable auto-deploy)."
             exit 0
           fi
-          flyctl deploy --remote-only --app hive-relay-enterprise --config deploy/fly.toml
+          # HIVE_RELAY_REQUIRE_DB=1 makes the prod app refuse to boot on the
+          # ephemeral in-memory store if DATABASE_URL is ever missing (P2-16); set
+          # here (not in the shared deploy/fly.toml) so self-host copies of the
+          # config keep the snapshot-store fallback.
+          flyctl deploy --remote-only --app hive-relay-enterprise --config deploy/fly.toml \
+            --env HIVE_RELAY_REQUIRE_DB=1
