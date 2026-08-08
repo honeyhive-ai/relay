@@ -122,9 +122,13 @@ const (
 
 // entitlementPolicy decides whether a presented bearer token is admitted.
 type entitlementPolicy struct {
-	kind   entitlementKind
-	tokens map[string]struct{} // entTokens
-	pubkey ed25519.PublicKey   // entSigned
+	kind entitlementKind
+	// tokenHashes holds SHA-256 hex of each allowlisted token (entTokens). Storing
+	// and comparing hashes (fixed length, constant-time) instead of the raw tokens
+	// avoids the data-dependent, early-exiting string compare of a raw-token map
+	// lookup, which could leak a valid token's length/prefix by timing (P3-13).
+	tokenHashes []string
+	pubkey      ed25519.PublicKey // entSigned
 }
 
 // entitlementFromEnv resolves the policy, most specific first:
@@ -140,14 +144,14 @@ func entitlementFromEnv() entitlementPolicy {
 		os.Stderr.WriteString("HIVE_RELAY_TOKEN_PUBKEY set but unparseable; ignoring\n")
 	}
 	if v := strings.TrimSpace(os.Getenv("HIVE_RELAY_ACCESS_TOKENS")); v != "" {
-		set := map[string]struct{}{}
+		var hashes []string
 		for _, t := range strings.Split(v, ",") {
 			if t = strings.TrimSpace(t); t != "" {
-				set[t] = struct{}{}
+				hashes = append(hashes, sha256hex(t))
 			}
 		}
-		if len(set) > 0 {
-			return entitlementPolicy{kind: entTokens, tokens: set}
+		if len(hashes) > 0 {
+			return entitlementPolicy{kind: entTokens, tokenHashes: hashes}
 		}
 	}
 	return entitlementPolicy{kind: entOpen}
@@ -165,7 +169,16 @@ func (p entitlementPolicy) Allow(token string, nowUnix int64) (*TokenClaims, boo
 	case entOpen:
 		return nil, true
 	case entTokens:
-		_, ok := p.tokens[token]
+		h := sha256hex(token)
+		ok := false
+		// Compare against every allowlisted hash with a constant-time compare and
+		// no early exit on match, so neither which token matched nor whether an
+		// early byte differed is observable by timing (P3-13).
+		for _, want := range p.tokenHashes {
+			if constantTimeEq(h, want) {
+				ok = true
+			}
+		}
 		return nil, ok
 	case entSigned:
 		claims, ok := verifyToken(token, p.pubkey)

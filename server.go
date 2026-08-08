@@ -54,6 +54,7 @@ type Options struct {
 	Store       Store               // required
 	Entitlement EntitlementVerifier // nil → EntitlementFromEnv()
 	WriteGuard  WriteGuard          // nil → allow all writes (content-blind)
+	ReadGuard   ReadGuard           // nil → allow all reads (open relay read-openness)
 	Hooks       Hooks               // nil → no-op
 	FriendCap   *int                // nil → unlimited
 	AdminAuth   AdminAuthorizer     // nil → /v1/admin/* disabled (404)
@@ -65,6 +66,7 @@ type Server struct {
 	store       Store
 	entitlement EntitlementVerifier
 	guard       WriteGuard      // nil = content-blind (no membership check)
+	readGuard   ReadGuard       // nil = open read-openness (no membership check)
 	hooks       Hooks           // nil = no-op
 	adminAuth   AdminAuthorizer // nil = admin API disabled
 	friendCap   *int
@@ -76,9 +78,20 @@ type Server struct {
 	pairMu       sync.Mutex
 	pairings     map[string]pairing
 	pairAttempts map[string]*pairAttempt // client → recent failed-resolve window
+	maxPairings  int                     // cap on live pairing codes (0 = unlimited)
 
-	pushLimiter *ipRateLimiter      // per-IP envelope-push rate limit
-	sseLimiter  *concurrencyLimiter // cap on concurrent SSE streams
+	pushLimiter    *ipRateLimiter      // per-IP write rate limit (all unauth writes)
+	sseLimiter     *concurrencyLimiter // cap on concurrent SSE streams
+	wsWriterLimit  *ipRateLimiter      // per-(workspace,writer) envelope-append rate
+	ghLimiter      *ipRateLimiter      // per-IP rate on GitHub-authenticated routes
+	inviteLimiter  *ipRateLimiter      // per-(sender,recipient) account-invite rate
+	ghCache        *identityCache      // token-hash → identity, short TTL
+	metricsToken   string              // ops credential for /metrics (env; "" = open)
+	metricsTokHash string              // sha256 of metricsToken for constant-time compare
+
+	healthMu      sync.Mutex // guards the cached /v1/health ping result
+	healthErr     error
+	healthChecked time.Time
 }
 
 type pairing struct {
@@ -97,18 +110,29 @@ func New(o Options) *Server {
 	if o.Entitlement == nil {
 		o.Entitlement = EntitlementFromEnv()
 	}
+	metricsToken := strings.TrimSpace(os.Getenv("HIVE_RELAY_METRICS_TOKEN"))
 	s := &Server{
-		store:        o.Store,
-		entitlement:  o.Entitlement,
-		guard:        o.WriteGuard,
-		hooks:        o.Hooks,
-		adminAuth:    o.AdminAuth,
-		friendCap:    o.FriendCap,
-		httpClient:   &http.Client{Timeout: 10 * time.Second},
-		pairings:     map[string]pairing{},
-		pairAttempts: map[string]*pairAttempt{},
-		pushLimiter:  newIPRateLimiter(envFloat("HIVE_RELAY_PUSH_RATE", 100), envFloat("HIVE_RELAY_PUSH_BURST", 300)),
-		sseLimiter:   newConcurrencyLimiter(envInt64("HIVE_RELAY_MAX_SSE", 2000)),
+		store:         o.Store,
+		entitlement:   o.Entitlement,
+		guard:         o.WriteGuard,
+		readGuard:     o.ReadGuard,
+		hooks:         o.Hooks,
+		adminAuth:     o.AdminAuth,
+		friendCap:     o.FriendCap,
+		httpClient:    &http.Client{Timeout: 10 * time.Second},
+		pairings:      map[string]pairing{},
+		pairAttempts:  map[string]*pairAttempt{},
+		maxPairings:   int(envInt64("HIVE_RELAY_MAX_PAIRINGS", defaultMaxLivePairings)),
+		pushLimiter:   newIPRateLimiter(envFloat("HIVE_RELAY_PUSH_RATE", 100), envFloat("HIVE_RELAY_PUSH_BURST", 300)),
+		sseLimiter:    newConcurrencyLimiter(envInt64("HIVE_RELAY_MAX_SSE", 2000)),
+		wsWriterLimit: newIPRateLimiter(envFloat("HIVE_RELAY_WS_WRITER_RATE", defaultWSWriterRate), envFloat("HIVE_RELAY_WS_WRITER_BURST", defaultWSWriterBurst)),
+		ghLimiter:     newIPRateLimiter(envFloat("HIVE_RELAY_GITHUB_RATE", defaultGitHubAuthRate), envFloat("HIVE_RELAY_GITHUB_BURST", defaultGitHubAuthBurst)),
+		inviteLimiter: newIPRateLimiter(envFloat("HIVE_RELAY_INVITE_RATE", defaultInviteRate), envFloat("HIVE_RELAY_INVITE_BURST", defaultInviteBurst)),
+		ghCache:       newIdentityCache(ghIdentityTTL, ghNegativeTTL),
+		metricsToken:  metricsToken,
+	}
+	if metricsToken != "" {
+		s.metricsTokHash = sha256hex(metricsToken)
 	}
 	s.verify = s.verifyGitHub
 	return s
@@ -134,7 +158,7 @@ func (s *Server) Handler() http.Handler {
 	// Public landing page at the exact root, and the health check.
 	mux.HandleFunc("GET /{$}", s.statusPage)
 	mux.HandleFunc("GET /v1/health", s.health)
-	mux.HandleFunc("GET /metrics", m.handler)
+	mux.HandleFunc("GET /metrics", s.guardMetrics(m.handler))
 
 	mux.HandleFunc("POST /v1/workspaces/{id}/envelopes", s.postEnvelope)
 	mux.HandleFunc("GET /v1/workspaces/{id}/envelopes", s.listEnvelopes)
@@ -233,6 +257,14 @@ func (s *Server) enforceRead(w http.ResponseWriter, r *http.Request, workspace s
 		http.Error(w, "relay requires a valid access token", http.StatusUnauthorized)
 		return false
 	}
+	// ReadGuard seam: nil on the open relay (read-openness unchanged); a downstream
+	// build can enforce membership on reads here, mirroring enforceWrite/WriteGuard.
+	if s.readGuard != nil {
+		if err := s.readGuard.CheckRead(r.Context(), workspace, claimsFrom(r.Context()), r); err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return false
+		}
+	}
 	return true
 }
 
@@ -247,9 +279,7 @@ func (s *Server) afterWorkspaceWrite(ctx context.Context, workspace string, seq 
 // (not just "return ok") so an orchestrator pulls a wedged or disconnected
 // backend out of rotation: 200 "ok" when the store answers, 503 otherwise.
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-	defer cancel()
-	if err := s.store.Ping(ctx); err != nil {
+	if err := s.cachedPing(r.Context()); err != nil {
 		http.Error(w, "store unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -257,18 +287,76 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
+// cachedPing round-trips the store but memoizes the result for a short TTL, so a
+// flood of health probes can't hammer the backend with a DB round-trip each
+// (P3-15). A cold or stale cache does one bounded (2s) ping.
+func (s *Server) cachedPing(ctx context.Context) error {
+	now := time.Now()
+	s.healthMu.Lock()
+	if !s.healthChecked.IsZero() && now.Sub(s.healthChecked) < healthPingCacheTTL {
+		err := s.healthErr
+		s.healthMu.Unlock()
+		return err
+	}
+	s.healthMu.Unlock()
+
+	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	err := s.store.Ping(pctx)
+
+	s.healthMu.Lock()
+	s.healthErr = err
+	s.healthChecked = time.Now()
+	s.healthMu.Unlock()
+	return err
+}
+
+// guardMetrics optionally protects /metrics with an ops credential (P3-15). When
+// HIVE_RELAY_METRICS_TOKEN is set, /metrics requires a matching bearer (constant-
+// time compared); unset keeps it open for back-compat with existing scrapers.
+func (s *Server) guardMetrics(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.metricsToken != "" {
+			if !constantTimeEq(sha256hex(bearerToken(r)), s.metricsTokHash) {
+				http.Error(w, "metrics authorization required", http.StatusUnauthorized)
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
 // ── Workspace sync handlers ───────────────────────────────────────────────────
 
-func (s *Server) postEnvelope(w http.ResponseWriter, r *http.Request) {
+// limitWrite applies the per-IP write-path rate limit shared by every
+// unauthenticated write (envelopes, keyring, presence, candidates, pairing), so
+// no unauth write path is left unbounded (P2-12). Returns false (after writing
+// 429) when the caller is over the limit.
+func (s *Server) limitWrite(w http.ResponseWriter, r *http.Request) bool {
 	if !s.pushLimiter.allow(clientIP(r)) {
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return false
+	}
+	return true
+}
+
+func (s *Server) postEnvelope(w http.ResponseWriter, r *http.Request) {
+	if !s.limitWrite(w, r) {
+		return
+	}
+	// Per-(workspace,writer) quota: bound how fast one identity can churn this
+	// workspace's retention window so it can't rapidly evict another member's
+	// history (P1-6). Content-blind — keyed on the entitlement subject or client
+	// IP, never the body.
+	id := r.PathValue("id")
+	if !s.wsWriterLimit.allow(id + "|" + writerTag(r.Context(), clientIP(r))) {
+		http.Error(w, "workspace write quota exceeded", http.StatusTooManyRequests)
 		return
 	}
 	var body json.RawMessage
 	if !readJSON(w, r, &body) {
 		return
 	}
-	id := r.PathValue("id")
 	if !s.enforceWrite(w, r, id) {
 		return
 	}
@@ -411,6 +499,9 @@ type deviceBlobReq struct {
 }
 
 func (s *Server) publishCandidates(w http.ResponseWriter, r *http.Request) {
+	if !s.limitWrite(w, r) {
+		return
+	}
 	var b deviceBlobReq
 	if !readJSON(w, r, &b) {
 		return
@@ -437,6 +528,9 @@ func (s *Server) listCandidates(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) publishPresence(w http.ResponseWriter, r *http.Request) {
+	if !s.limitWrite(w, r) {
+		return
+	}
 	var b deviceBlobReq
 	if !readJSON(w, r, &b) {
 		return
@@ -463,6 +557,9 @@ func (s *Server) listPresence(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) publishKeyring(w http.ResponseWriter, r *http.Request) {
+	if !s.limitWrite(w, r) {
+		return
+	}
 	var body json.RawMessage
 	if !readJSON(w, r, &body) {
 		return
@@ -497,6 +594,9 @@ type pairReq struct {
 }
 
 func (s *Server) createPairing(w http.ResponseWriter, r *http.Request) {
+	if !s.limitWrite(w, r) {
+		return
+	}
 	var req pairReq
 	if !readJSON(w, r, &req) {
 		return
@@ -522,6 +622,14 @@ func (s *Server) createPairing(w http.ResponseWriter, r *http.Request) {
 
 	s.pairMu.Lock()
 	s.prunePairings()
+	// Cap live pairing codes so an attacker can't exhaust memory by spraying
+	// creates (P2-12). Checked after pruning expired entries so only genuinely
+	// live codes count against the cap.
+	if s.maxPairings > 0 && len(s.pairings) >= s.maxPairings {
+		s.pairMu.Unlock()
+		http.Error(w, "too many live pairings", http.StatusServiceUnavailable)
+		return
+	}
 	var code string
 	for {
 		code = randomPairCode()
@@ -737,13 +845,20 @@ func (s *Server) accountInviteCreate(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &body) {
 		return
 	}
-	user, _, ok := s.callerAccount(w, r)
+	user, fromAccount, ok := s.callerAccount(w, r)
 	if !ok {
 		return
 	}
 	toLogin := strings.TrimPrefix(strings.TrimSpace(body.ToLogin), "@")
 	if toLogin == "" || len(body.Invite) == 0 {
 		http.Error(w, "toLogin and invite are required", http.StatusBadRequest)
+		return
+	}
+	// Per-(sender,recipient) invite rate limit so one account can't flood another's
+	// inbox with workspace invites (P1-7). Generous burst (default 10) then a slow
+	// sustained rate; keyed on the verified sender + target handle.
+	if !s.inviteLimiter.allow(fromAccount + "->" + lower(toLogin)) {
+		http.Error(w, "too many invites to this user", http.StatusTooManyRequests)
 		return
 	}
 	toAccount, found, err := s.store.AccountKeyForLogin(r.Context(), toLogin)
@@ -753,6 +868,18 @@ func (s *Server) accountInviteCreate(w http.ResponseWriter, r *http.Request) {
 	if !found {
 		http.Error(w, "user hasn't joined Hive", http.StatusNotFound)
 		return
+	}
+	// Optional stronger control (off by default to preserve open-relay behavior):
+	// require an existing friend relationship before an invite is delivered, so
+	// invites can only reach people the sender already knows (P1-7). Enabled via
+	// HIVE_RELAY_INVITE_REQUIRE_FRIEND=1.
+	if envBool("HIVE_RELAY_INVITE_REQUIRE_FRIEND") {
+		if ok, err := s.store.AreFriends(r.Context(), fromAccount, toAccount); storeErr(w, err) {
+			return
+		} else if !ok {
+			http.Error(w, "must be friends to send an invite", http.StatusForbidden)
+			return
+		}
 	}
 	event := mustJSON(map[string]any{
 		"kind":      "workspaceInvite",
@@ -957,12 +1084,48 @@ func (s *Server) requireGitHub(w http.ResponseWriter, r *http.Request) (*githubU
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return nil, false
 	}
-	user, err := s.verify(r.Context(), token)
+	// Per-IP limit on the GitHub-authenticated routes (directory / account /
+	// friends) so a flood can't be amplified into one outbound api.github.com call
+	// per request, and to throttle bulk directory / membership enumeration (P1-8,
+	// P2-14). Generous (default 30/s, burst 120); env-tunable.
+	if !s.ghLimiter.allow(clientIP(r)) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return nil, false
+	}
+	user, err := s.verifyCached(r.Context(), token)
 	if err != nil || user == nil {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return nil, false
 	}
 	return user, true
+}
+
+// verifyCached wraps s.verify with a token-hash-keyed identity cache and an
+// upfront plausibility screen, so repeated (or junk) tokens don't each trigger an
+// outbound verification (P1-8). Transient verify errors are surfaced (never
+// cached); a verified-invalid token is cached as a short-lived negative so a
+// junk-token replay still can't amplify.
+func (s *Server) verifyCached(ctx context.Context, token string) (*githubUser, error) {
+	if !plausibleGitHubToken(token) {
+		return nil, nil // obviously-malformed → unauthorized without any outbound call
+	}
+	if s.ghCache == nil {
+		return s.verify(ctx, token)
+	}
+	h := sha256hex(token)
+	now := time.Now()
+	if user, negative, hit := s.ghCache.get(h, now); hit {
+		if negative {
+			return nil, nil
+		}
+		return user, nil
+	}
+	user, err := s.verify(ctx, token)
+	if err != nil {
+		return nil, err // transient (network / decode) — don't cache
+	}
+	s.ghCache.put(h, user, now) // user may be nil → cached negative
+	return user, nil
 }
 
 // callerAccount resolves the authenticated caller's identity → account key.

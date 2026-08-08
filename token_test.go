@@ -130,7 +130,7 @@ func TestEntitlementPolicies(t *testing.T) {
 	}
 
 	// Tokens checks membership.
-	gated := entitlementPolicy{kind: entTokens, tokens: map[string]struct{}{"paid-tok": {}}}
+	gated := entitlementPolicy{kind: entTokens, tokenHashes: []string{sha256hex("paid-tok")}}
 	if _, ok := gated.Allow("", 0); ok {
 		t.Fatal("gated should reject empty")
 	}

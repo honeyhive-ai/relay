@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -178,6 +177,10 @@ CREATE TABLE IF NOT EXISTS relay_inbox (
   body        TEXT   NOT NULL,
   PRIMARY KEY (account_key, seq)
 );
+-- Insert time (unix seconds) so inbox retention can prune by age. NULL on rows
+-- written before this column existed — age-pruning skips those; the per-account
+-- row cap still bounds them.
+ALTER TABLE relay_inbox ADD COLUMN IF NOT EXISTS created_at BIGINT;
 CREATE TABLE IF NOT EXISTS relay_friend_requests (
   id           TEXT PRIMARY KEY,
   from_account TEXT NOT NULL,
@@ -306,6 +309,65 @@ func (s *postgresStore) PruneEnvelopes(ctx context.Context, maxEnvelopes int, ma
 	return total, nil
 }
 
+// PruneInbox bounds the account-inbox table (P2-13): drop rows older than maxAge
+// (those with a created_at stamp) and keep at most maxRows most-recent per
+// account (by seq). A zero bound disables that half. Returns rows deleted.
+func (s *postgresStore) PruneInbox(ctx context.Context, maxRows int, maxAge time.Duration) (int64, error) {
+	var total int64
+	if maxAge > 0 {
+		cutoff := time.Now().Add(-maxAge).Unix()
+		ct, err := s.pool.Exec(ctx,
+			`DELETE FROM relay_inbox WHERE created_at IS NOT NULL AND created_at < $1`, cutoff)
+		if err != nil {
+			return total, err
+		}
+		total += ct.RowsAffected()
+	}
+	if maxRows > 0 {
+		ct, err := s.pool.Exec(ctx,
+			`DELETE FROM relay_inbox i
+			 USING (SELECT account_key, MAX(seq) AS mx FROM relay_inbox GROUP BY account_key) m
+			 WHERE i.account_key = m.account_key AND i.seq <= m.mx - $1`, int64(maxRows))
+		if err != nil {
+			return total, err
+		}
+		total += ct.RowsAffected()
+	}
+	return total, nil
+}
+
+// PruneKeyring keeps at most maxPerWorkspace most-recent key-rotation rows (by id)
+// per workspace (P2-13). Returns rows deleted.
+func (s *postgresStore) PruneKeyring(ctx context.Context, maxPerWorkspace int) (int64, error) {
+	if maxPerWorkspace <= 0 {
+		return 0, nil
+	}
+	ct, err := s.pool.Exec(ctx,
+		`DELETE FROM relay_keyring k
+		 USING (SELECT workspace, MAX(id) AS mx FROM relay_keyring GROUP BY workspace) m
+		 WHERE k.workspace = m.workspace AND k.id <= m.mx - $1`, int64(maxPerWorkspace))
+	if err != nil {
+		return 0, err
+	}
+	return ct.RowsAffected(), nil
+}
+
+// PruneFriendRequests sweeps terminal (non-pending) friend requests older than
+// maxAge (P2-13); pending requests still expire via requestTTLSecs on read. A
+// zero bound disables it. Returns rows deleted.
+func (s *postgresStore) PruneFriendRequests(ctx context.Context, maxAge time.Duration) (int64, error) {
+	if maxAge <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().Add(-maxAge).Unix()
+	ct, err := s.pool.Exec(ctx,
+		`DELETE FROM relay_friend_requests WHERE state <> 'pending' AND created_at < $1`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return ct.RowsAffected(), nil
+}
+
 // subscribeWorkspace / latestSeq satisfy notifyStore (see the memory store).
 func (s *postgresStore) subscribeWorkspace(workspace string) (<-chan uint64, func()) {
 	return s.notify.subscribe(workspace)
@@ -357,10 +419,27 @@ func (s *postgresStore) EnvelopesAfter(ctx context.Context, workspace string, af
 }
 
 func (s *postgresStore) PutCandidate(ctx context.Context, workspace, deviceID string, candidate json.RawMessage) error {
-	_, err := s.pool.Exec(ctx,
+	if _, err := s.pool.Exec(ctx,
 		`INSERT INTO relay_candidates (workspace, device_id, blob) VALUES ($1, $2, $3)
 		 ON CONFLICT (workspace, device_id) DO UPDATE SET blob = EXCLUDED.blob`,
-		workspace, deviceID, string(candidate))
+		workspace, deviceID, string(candidate)); err != nil {
+		return err
+	}
+	return s.capDeviceBlobs(ctx, "relay_candidates", workspace)
+}
+
+// capDeviceBlobs bounds the per-workspace device-blob rows so an attacker can't
+// grow a table without limit by spraying distinct device ids (P2-12). Blobs are
+// ephemeral rendezvous state (a live device re-publishes), so evicting surplus
+// rows (arbitrary ctid order) is safe.
+func (s *postgresStore) capDeviceBlobs(ctx context.Context, table, workspace string) error {
+	if defaultMaxDeviceBlobsPerWS <= 0 {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM `+table+` WHERE ctid IN (
+		   SELECT ctid FROM `+table+` WHERE workspace = $1 ORDER BY ctid OFFSET $2
+		 )`, workspace, int64(defaultMaxDeviceBlobsPerWS))
 	return err
 }
 
@@ -369,11 +448,13 @@ func (s *postgresStore) Candidates(ctx context.Context, workspace string) (map[s
 }
 
 func (s *postgresStore) PutPresence(ctx context.Context, workspace, deviceID string, presence json.RawMessage) error {
-	_, err := s.pool.Exec(ctx,
+	if _, err := s.pool.Exec(ctx,
 		`INSERT INTO relay_presence (workspace, device_id, blob) VALUES ($1, $2, $3)
 		 ON CONFLICT (workspace, device_id) DO UPDATE SET blob = EXCLUDED.blob`,
-		workspace, deviceID, string(presence))
-	return err
+		workspace, deviceID, string(presence)); err != nil {
+		return err
+	}
+	return s.capDeviceBlobs(ctx, "relay_presence", workspace)
 }
 
 func (s *postgresStore) PresenceBlobs(ctx context.Context, workspace string) (map[string]json.RawMessage, error) {
@@ -400,9 +481,22 @@ func (s *postgresStore) deviceBlobs(ctx context.Context, table, workspace string
 }
 
 func (s *postgresStore) AppendKeyRotation(ctx context.Context, workspace string, blob json.RawMessage) error {
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO relay_keyring (workspace, blob) VALUES ($1, $2)`, workspace, string(blob))
-	return err
+	if _, err := s.pool.Exec(ctx,
+		`INSERT INTO relay_keyring (workspace, blob) VALUES ($1, $2)`, workspace, string(blob)); err != nil {
+		return err
+	}
+	// Bound key-rotation growth per workspace (P2-12): keep only the most-recent
+	// rows (by id) past the cap.
+	if defaultMaxKeyringPerWS > 0 {
+		if _, err := s.pool.Exec(ctx,
+			`DELETE FROM relay_keyring
+			 WHERE workspace = $1
+			   AND id <= (SELECT MAX(id) FROM relay_keyring WHERE workspace = $1) - $2`,
+			workspace, int64(defaultMaxKeyringPerWS)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *postgresStore) KeyRotations(ctx context.Context, workspace string) ([]json.RawMessage, error) {
@@ -539,9 +633,18 @@ func (s *postgresStore) PushAccountEvent(ctx context.Context, key string, body j
 		return 0, err
 	}
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO relay_inbox (account_key, seq, body) VALUES ($1, $2, $3)`,
-		key, seq, string(body)); err != nil {
+		`INSERT INTO relay_inbox (account_key, seq, body, created_at) VALUES ($1, $2, $3, $4)`,
+		key, seq, string(body), time.Now().Unix()); err != nil {
 		return 0, err
+	}
+	// Bound inbox growth: past the cap, drop this account's oldest rows so inbox
+	// spam can't grow an account without limit (P1-7).
+	if defaultInboxMaxRows > 0 {
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM relay_inbox WHERE account_key = $1 AND seq <= $2 - $3`,
+			key, seq, int64(defaultInboxMaxRows)); err != nil {
+			return 0, err
+		}
 	}
 	return seq, tx.Commit(ctx)
 }
@@ -955,8 +1058,9 @@ func (s *postgresStore) IssueToken(ctx context.Context, userID, label, tokenHash
 		`INSERT INTO relay_tokens (id, user_id, token_hash, label, created_at) VALUES ($1, $2, $3, $4, $5)`,
 		rec.ID, rec.UserID, tokenHash, rec.Label, rec.CreatedAt)
 	if err != nil {
-		// FK violation ⇒ unknown user.
-		if strings.Contains(err.Error(), "relay_tokens_user_id_fkey") {
+		// FK violation (23503) ⇒ the user_id references no user.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
 			return TokenRecord{}, ErrUserNotFound
 		}
 		return TokenRecord{}, err
@@ -1014,7 +1118,7 @@ func (s *postgresStore) ResolveToken(ctx context.Context, tokenHash string, now 
 		   FROM relay_tokens t JOIN relay_users u ON u.id = t.user_id
 		  WHERE t.token_hash = $1`, tokenHash).Scan(&userID, &login, &disabled, &revoked)
 	if err != nil {
-		if strings.Contains(err.Error(), "no rows") {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, false, nil
 		}
 		return nil, false, err

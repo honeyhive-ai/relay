@@ -58,6 +58,14 @@ type memoryStore struct {
 	retentionMaxEnvelopes int
 	retentionMaxAge       time.Duration
 
+	// Structural caps that bound unauthenticated growth (0 = unbounded):
+	//   inboxMaxRows      — per-account inbox rows (oldest evicted past the cap).
+	//   maxKeyringPerWS   — key-rotation rows per workspace.
+	//   maxDeviceBlobsPerWS — candidate/presence device entries per workspace.
+	inboxMaxRows        int
+	maxKeyringPerWS     int
+	maxDeviceBlobsPerWS int
+
 	// notify wakes SSE subscribers of this workspace on a genuinely new append
 	// (in-process; see wsNotifier).
 	notify *wsNotifier
@@ -117,6 +125,9 @@ func newMemoryStore() *memoryStore {
 		tokenHash:             map[string]string{},
 		retentionMaxEnvelopes: maxEnv,
 		retentionMaxAge:       maxAge,
+		inboxMaxRows:          int(envInt64("HIVE_RELAY_INBOX_MAX_ROWS", defaultInboxMaxRows)),
+		maxKeyringPerWS:       int(envInt64("HIVE_RELAY_MAX_KEYRING_PER_WS", defaultMaxKeyringPerWS)),
+		maxDeviceBlobsPerWS:   int(envInt64("HIVE_RELAY_MAX_DEVICE_BLOBS_PER_WS", defaultMaxDeviceBlobsPerWS)),
 		notify:                newWSNotifier(),
 	}
 }
@@ -266,8 +277,27 @@ func (s *memoryStore) EnvelopesAfter(_ context.Context, workspace string, after 
 func (s *memoryStore) PutCandidate(_ context.Context, workspace, deviceID string, candidate json.RawMessage) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.workspace(workspace).candidates[deviceID] = candidate
+	m := s.workspace(workspace).candidates
+	capDeviceBlobs(m, deviceID, s.maxDeviceBlobsPerWS)
+	m[deviceID] = candidate
 	return nil
+}
+
+// capDeviceBlobs bounds a per-workspace device-blob map so an attacker can't grow
+// it without limit by spraying distinct device ids (P2-12). If the map is at the
+// cap and deviceID is new, it evicts one existing entry first (blobs are
+// ephemeral rendezvous state — a live device simply re-publishes).
+func capDeviceBlobs(m map[string]json.RawMessage, deviceID string, limit int) {
+	if limit <= 0 {
+		return
+	}
+	if _, exists := m[deviceID]; exists || len(m) < limit {
+		return
+	}
+	for k := range m { // drop one arbitrary entry to make room
+		delete(m, k)
+		break
+	}
 }
 
 func (s *memoryStore) Candidates(_ context.Context, workspace string) (map[string]json.RawMessage, error) {
@@ -285,7 +315,9 @@ func (s *memoryStore) Candidates(_ context.Context, workspace string) (map[strin
 func (s *memoryStore) PutPresence(_ context.Context, workspace, deviceID string, presence json.RawMessage) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.workspace(workspace).presence[deviceID] = presence
+	m := s.workspace(workspace).presence
+	capDeviceBlobs(m, deviceID, s.maxDeviceBlobsPerWS)
+	m[deviceID] = presence
 	return nil
 }
 
@@ -306,6 +338,11 @@ func (s *memoryStore) AppendKeyRotation(_ context.Context, workspace string, blo
 	defer s.mu.Unlock()
 	w := s.workspace(workspace)
 	w.keyring = append(w.keyring, blob)
+	// Bound key-rotation growth per workspace (P2-12): keep only the most-recent
+	// rows past the cap.
+	if s.maxKeyringPerWS > 0 && len(w.keyring) > s.maxKeyringPerWS {
+		w.keyring = append([]json.RawMessage(nil), w.keyring[len(w.keyring)-s.maxKeyringPerWS:]...)
+	}
 	return nil
 }
 
@@ -388,6 +425,12 @@ func (s *memoryStore) PushAccountEvent(_ context.Context, key string, body json.
 	a := s.account(key)
 	a.nextSeq++
 	a.inbox = append(a.inbox, InboxRow{Seq: a.nextSeq, Body: body})
+	// Bound inbox growth: past the cap, drop the oldest rows so inbox spam can't
+	// grow an account without limit (P1-7). The relay is a recent-traffic cache;
+	// clients that fell far behind re-sync from a peer.
+	if s.inboxMaxRows > 0 && len(a.inbox) > s.inboxMaxRows {
+		a.inbox = append([]InboxRow(nil), a.inbox[len(a.inbox)-s.inboxMaxRows:]...)
+	}
 	return a.nextSeq, nil
 }
 

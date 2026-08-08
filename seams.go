@@ -39,6 +39,17 @@ type WriteGuard interface {
 	CheckWrite(ctx context.Context, workspace string, claims *TokenClaims, r *http.Request) error
 }
 
+// ReadGuard runs before any workspace read (envelopes / keyring / candidates /
+// presence), mirroring WriteGuard. Return a non-nil error to reject the read
+// (mapped to 403). Default nil = the open relay's content-blind read-openness is
+// unchanged (reads are gated only by the entitlement, exactly as before). A
+// downstream build (e.g. the enterprise binary) can set one to enforce workspace
+// membership on reads from the verified claims — the read-side analogue of
+// WriteGuard — WITHOUT this package changing the open relay's behavior.
+type ReadGuard interface {
+	CheckRead(ctx context.Context, workspace string, claims *TokenClaims, r *http.Request) error
+}
+
 // AdminAuthorizer gates the user/token management API (/v1/admin/*). It runs
 // instead of the entitlement gate for those routes — an operator manages access
 // tokens with their own credential, not a relay token. Return (adminID, true)

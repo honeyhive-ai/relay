@@ -106,8 +106,18 @@ func Main() {
 }
 
 // buildStore selects the storage backend from the environment.
+//
+// The public production relay sets HIVE_RELAY_REQUIRE_DB=1 so it REFUSES to boot
+// on the ephemeral in-memory fallback: a missing/typo'd DATABASE_URL there would
+// otherwise silently serve every client from volatile memory and lose state on
+// the next machine move (P2-16). Self-hosters leave it unset and keep the
+// snapshot-store fallback.
 func buildStore(ctx context.Context) (Store, error) {
-	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
+	dsn := os.Getenv("DATABASE_URL")
+	if envBool("HIVE_RELAY_REQUIRE_DB") && dsn == "" {
+		return nil, fmt.Errorf("HIVE_RELAY_REQUIRE_DB is set but DATABASE_URL is empty: refusing to boot on the ephemeral in-memory store")
+	}
+	if dsn != "" {
 		return newPostgresStore(ctx, dsn)
 	}
 	if dir := os.Getenv("HIVE_RELAY_DATA_DIR"); dir != "" {
@@ -150,17 +160,21 @@ func flushLoop(store Store, stop <-chan struct{}) {
 	}
 }
 
-// envelopePruner is implemented by backends whose envelope log needs periodic
+// envelopePruner is implemented by backends whose durable logs need periodic
 // pruning (Postgres). The in-memory store prunes inline at write time instead.
+// Beyond envelopes, the loop also sweeps the inbox, keyring, and terminal friend
+// requests so no durable table grows without bound (P2-13).
 type envelopePruner interface {
 	PruneEnvelopes(ctx context.Context, maxEnvelopes int, maxAge time.Duration) (int64, error)
+	PruneInbox(ctx context.Context, maxRows int, maxAge time.Duration) (int64, error)
+	PruneKeyring(ctx context.Context, maxPerWorkspace int) (int64, error)
+	PruneFriendRequests(ctx context.Context, maxAge time.Duration) (int64, error)
 }
 
 func pruneLoop(pruner envelopePruner, stop <-chan struct{}) {
 	maxEnv, maxAge := retentionFromEnv()
-	if maxEnv <= 0 && maxAge <= 0 {
-		return // retention fully disabled
-	}
+	inboxAge := daysEnv("HIVE_RELAY_INBOX_RETENTION_DAYS", defaultInboxMaxAgeDays)
+	friendReqAge := daysEnv("HIVE_RELAY_FRIEND_REQ_RETENTION_DAYS", defaultFriendReqMaxAgeDays)
 	tick := time.NewTicker(time.Hour)
 	defer tick.Stop()
 	for {
@@ -168,14 +182,41 @@ func pruneLoop(pruner envelopePruner, stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-tick.C:
-			n, err := pruner.PruneEnvelopes(context.Background(), maxEnv, maxAge)
-			if err != nil {
-				slog.Warn("envelope prune failed", "error", err)
-			} else if n > 0 {
-				slog.Info("pruned envelopes", "deleted", n)
-			}
+			runPrune("envelopes", func() (int64, error) {
+				return pruner.PruneEnvelopes(context.Background(), maxEnv, maxAge)
+			})
+			runPrune("inbox", func() (int64, error) {
+				return pruner.PruneInbox(context.Background(), defaultInboxMaxRows, inboxAge)
+			})
+			runPrune("keyring", func() (int64, error) {
+				return pruner.PruneKeyring(context.Background(), defaultMaxKeyringPerWS)
+			})
+			runPrune("friend_requests", func() (int64, error) {
+				return pruner.PruneFriendRequests(context.Background(), friendReqAge)
+			})
 		}
 	}
+}
+
+// runPrune executes one prune step and logs the outcome.
+func runPrune(what string, fn func() (int64, error)) {
+	n, err := fn()
+	if err != nil {
+		slog.Warn("prune failed", "table", what, "error", err)
+	} else if n > 0 {
+		slog.Info("pruned rows", "table", what, "deleted", n)
+	}
+}
+
+// daysEnv reads a non-negative day count from env, else the default (0 disables).
+func daysEnv(name string, def int) time.Duration {
+	d := def
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			d = n
+		}
+	}
+	return time.Duration(d) * 24 * time.Hour
 }
 
 func fatalIf(err error) {

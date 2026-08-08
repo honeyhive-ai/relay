@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -65,14 +66,82 @@ func (m *metrics) observe(next http.Handler) http.Handler {
 		if class := rec.status / 100; class >= 1 && class <= 5 {
 			m.byClass[class].Add(1)
 		}
+		// Log a normalized ROUTE TEMPLATE, never the raw path: raw paths carry
+		// secrets — pairing codes (/v1/pair/<code>), workspace ids, @handles,
+		// account keys, token/request ids — which must not land in logs (P2-15).
+		// And log the real client IP (Fly-Client-IP behind the edge), not the
+		// shared proxy address in RemoteAddr.
 		slog.Info("request",
 			"method", r.Method,
-			"path", r.URL.Path,
+			"route", routeTemplate(r.URL.Path),
 			"status", rec.status,
 			"dur_ms", time.Since(start).Milliseconds(),
-			"remote", r.RemoteAddr,
+			"ip", clientIP(r),
 		)
 	})
+}
+
+// routeTemplates lists every served path as a segment pattern; a "{}" segment
+// matches any single path segment (an id, code, handle, or key) and is redacted
+// to its placeholder in logs. Longest/most-specific patterns are listed first so
+// they win over shorter prefixes.
+var routeTemplates = [][]string{
+	{"v1", "health"},
+	{"v1", "workspaces", "{}", "envelopes"},
+	{"v1", "workspaces", "{}", "events"},
+	{"v1", "workspaces", "{}", "candidates"},
+	{"v1", "workspaces", "{}", "presence"},
+	{"v1", "workspaces", "{}", "keyring"},
+	{"v1", "pair", "{}"},
+	{"v1", "pair"},
+	{"v1", "directory", "register"},
+	{"v1", "directory", "{}"},
+	{"v1", "account", "register"},
+	{"v1", "account", "heartbeat"},
+	{"v1", "account", "inbox"},
+	{"v1", "account", "devices"},
+	{"v1", "account", "visibility"},
+	{"v1", "account", "invites"},
+	{"v1", "friends", "presence"},
+	{"v1", "friends", "requests", "{}", "accept"},
+	{"v1", "friends", "requests", "{}", "reject"},
+	{"v1", "friends", "requests"},
+	{"v1", "friends", "{}", "devices"},
+	{"v1", "friends", "{}"},
+	{"v1", "friends"},
+	{"v1", "admin", "users", "{}", "tokens"},
+	{"v1", "admin", "users", "{}", "disabled"},
+	{"v1", "admin", "users"},
+	{"v1", "admin", "tokens", "{}"},
+}
+
+// routeTemplate maps a request path to its logged template (secret segments
+// redacted), or "other" when nothing matches — so a novel/probe path can't smuggle
+// a secret into the logs either.
+func routeTemplate(path string) string {
+	if path == "/" || path == "" {
+		return "/"
+	}
+	if path == "/metrics" {
+		return "/metrics"
+	}
+	segs := strings.Split(strings.Trim(path, "/"), "/")
+	for _, tmpl := range routeTemplates {
+		if len(tmpl) != len(segs) {
+			continue
+		}
+		match := true
+		for i := range tmpl {
+			if tmpl[i] != "{}" && tmpl[i] != segs[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return "/" + strings.Join(tmpl, "/")
+		}
+	}
+	return "other"
 }
 
 func (m *metrics) handler(w http.ResponseWriter, _ *http.Request) {
