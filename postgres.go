@@ -638,11 +638,16 @@ func (s *postgresStore) PushAccountEvent(ctx context.Context, key string, body j
 		return 0, err
 	}
 	// Bound inbox growth: past the cap, drop this account's oldest rows so inbox
-	// spam can't grow an account without limit (P1-7).
-	if defaultInboxMaxRows > 0 {
+	// spam can't grow an account without limit (P1-7). Compute the cutoff seq in Go
+	// and pass a single int8 param — the SQL form `seq <= $2 - $3` mixed a uint64
+	// ($2) and int64 ($3) param, tripping pgx's arithmetic type inference and
+	// erroring the whole push. Skipped until an account is actually over the cap,
+	// so the common case runs no extra query.
+	if defaultInboxMaxRows > 0 && seq > uint64(defaultInboxMaxRows) {
+		cutoff := int64(seq - uint64(defaultInboxMaxRows))
 		if _, err := tx.Exec(ctx,
-			`DELETE FROM relay_inbox WHERE account_key = $1 AND seq <= $2 - $3`,
-			key, seq, int64(defaultInboxMaxRows)); err != nil {
+			`DELETE FROM relay_inbox WHERE account_key = $1 AND seq <= $2`,
+			key, cutoff); err != nil {
 			return 0, err
 		}
 	}
