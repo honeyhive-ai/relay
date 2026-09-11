@@ -221,6 +221,17 @@ type Store interface {
 	AppendKeyRotation(ctx context.Context, workspace string, blob json.RawMessage) error
 	KeyRotations(ctx context.Context, workspace string) ([]json.RawMessage, error)
 
+	// Relay-managed team membership. A workspace with a non-empty roster is
+	// "claimed": the membership guard then enforces access for it; an unclaimed
+	// (empty-roster) workspace stays open + content-blind, the default.
+	// ClaimWorkspace seeds the first caller as Owner iff the roster is empty
+	// (returns true); on an already-claimed workspace it makes no change (false).
+	ClaimWorkspace(ctx context.Context, workspace, account, login string, now int64) (bool, error)
+	WorkspaceMembers(ctx context.Context, workspace string) ([]MemberRow, error)
+	UpsertMember(ctx context.Context, workspace, account, login, role, addedBy string, now int64) error
+	RemoveMember(ctx context.Context, workspace, account string) error
+	MemberRole(ctx context.Context, workspace, account string) (string, bool, error)
+
 	// Identity directory (invite-by-handle, seal-to-all-devices).
 	UpsertDirDevice(ctx context.Context, githubID uint64, login string, name *string, deviceID, kaPub string) error
 	DirAccountByHandle(ctx context.Context, handle string) (*DirAccount, error)

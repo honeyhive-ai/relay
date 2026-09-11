@@ -143,6 +143,15 @@ CREATE TABLE IF NOT EXISTS relay_keyring (
   blob      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS relay_keyring_ws ON relay_keyring (workspace, id);
+CREATE TABLE IF NOT EXISTS relay_workspace_members (
+  workspace TEXT   NOT NULL,
+  account   TEXT   NOT NULL,
+  login     TEXT   NOT NULL DEFAULT '',
+  role      TEXT   NOT NULL,
+  added_by  TEXT   NOT NULL DEFAULT '',
+  added_at  BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY (workspace, account)
+);
 CREATE TABLE IF NOT EXISTS relay_directory (
   login     TEXT PRIMARY KEY,
   github_id BIGINT NOT NULL,
@@ -515,6 +524,72 @@ func (s *postgresStore) KeyRotations(ctx context.Context, workspace string) ([]j
 		out = append(out, json.RawMessage(blob))
 	}
 	return out, rows.Err()
+}
+
+// ── Relay-managed team membership ───────────────────────────────────────────────
+
+func (s *postgresStore) ClaimWorkspace(ctx context.Context, workspace, account, login string, now int64) (bool, error) {
+	// Atomic first-claim: insert an owner only when the roster is empty. A PK on
+	// (workspace, account) plus the NOT EXISTS guard makes a repeat claim a no-op.
+	tag, err := s.pool.Exec(ctx,
+		`INSERT INTO relay_workspace_members (workspace, account, login, role, added_by, added_at)
+		 SELECT $1, $2, $3, 'owner', $2, $4
+		 WHERE NOT EXISTS (SELECT 1 FROM relay_workspace_members WHERE workspace = $1)`,
+		workspace, account, login, now)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func (s *postgresStore) WorkspaceMembers(ctx context.Context, workspace string) ([]MemberRow, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT account, login, role, added_by, added_at FROM relay_workspace_members
+		 WHERE workspace = $1
+		 ORDER BY CASE role WHEN 'owner' THEN 3 WHEN 'admin' THEN 2 WHEN 'contributor' THEN 1 ELSE 0 END DESC, account`,
+		workspace)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []MemberRow{}
+	for rows.Next() {
+		var m MemberRow
+		if err := rows.Scan(&m.Account, &m.Login, &m.Role, &m.AddedBy, &m.AddedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) UpsertMember(ctx context.Context, workspace, account, login, role, addedBy string, now int64) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO relay_workspace_members (workspace, account, login, role, added_by, added_at)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 ON CONFLICT (workspace, account) DO UPDATE SET login = EXCLUDED.login, role = EXCLUDED.role`,
+		workspace, account, login, role, addedBy, now)
+	return err
+}
+
+func (s *postgresStore) RemoveMember(ctx context.Context, workspace, account string) error {
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM relay_workspace_members WHERE workspace = $1 AND account = $2`, workspace, account)
+	return err
+}
+
+func (s *postgresStore) MemberRole(ctx context.Context, workspace, account string) (string, bool, error) {
+	var role string
+	err := s.pool.QueryRow(ctx,
+		`SELECT role FROM relay_workspace_members WHERE workspace = $1 AND account = $2`,
+		workspace, account).Scan(&role)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return role, true, nil
 }
 
 // ── Identity directory ─────────────────────────────────────────────────────────

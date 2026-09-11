@@ -52,6 +52,8 @@ type wsSnap struct {
 	Candidates map[string]json.RawMessage `json:"candidates"`
 	Presence   map[string]json.RawMessage `json:"presence"`
 	Keyring    []json.RawMessage          `json:"keyring"`
+	// Relay-managed team roster; absent from older snapshots (nil → unclaimed).
+	Members map[string]*MemberRow `json:"members,omitempty"`
 }
 
 type dirSnap struct {
@@ -147,6 +149,10 @@ func (s *memoryStore) restore(snap snapshot) {
 			candidates: cand,
 			presence:   pres,
 			keyring:    w.Keyring,
+			members:    w.Members,
+		}
+		if ws.members == nil {
+			ws.members = map[string]*MemberRow{}
 		}
 		s.pruneEnvelopesLocked(ws, time.Now().Unix())
 		s.workspaces[id] = ws
@@ -232,6 +238,7 @@ func (s *memoryStore) toSnapshot() snapshot {
 		snap.Workspaces[id] = wsSnap{
 			Envelopes: w.envelopes, EnvAt: w.envAt, EnvKey: w.envKey, NextSeq: w.nextSeq,
 			Candidates: w.candidates, Presence: w.presence, Keyring: w.keyring,
+			Members: w.members,
 		}
 	}
 	for k, d := range s.directory {

@@ -95,6 +95,9 @@ type memWorkspace struct {
 	candidates map[string]json.RawMessage
 	presence   map[string]json.RawMessage
 	keyring    []json.RawMessage
+	// Relay-managed team roster, keyed by account. Empty = unclaimed (open,
+	// content-blind); non-empty = the membership guard enforces this workspace.
+	members map[string]*MemberRow
 }
 
 type memDeviceReg struct {
@@ -171,6 +174,7 @@ func (s *memoryStore) workspace(id string) *memWorkspace {
 		w = &memWorkspace{
 			candidates: map[string]json.RawMessage{},
 			presence:   map[string]json.RawMessage{},
+			members:    map[string]*MemberRow{},
 		}
 		s.workspaces[id] = w
 	}

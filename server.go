@@ -58,6 +58,10 @@ type Options struct {
 	Hooks       Hooks               // nil → no-op
 	FriendCap   *int                // nil → unlimited
 	AdminAuth   AdminAuthorizer     // nil → /v1/admin/* disabled (404)
+	// Membership enables relay-managed team roster routes + the membership guard.
+	// Also enabled by env HIVE_RELAY_MEMBERSHIP=1. Off → the relay is unchanged
+	// (no roster routes, content-blind forwarding).
+	Membership bool
 }
 
 // Server holds the durable Store plus the ephemeral, instance-local pieces
@@ -69,6 +73,7 @@ type Server struct {
 	readGuard   ReadGuard       // nil = open read-openness (no membership check)
 	hooks       Hooks           // nil = no-op
 	adminAuth   AdminAuthorizer // nil = admin API disabled
+	membership  bool            // relay-managed team membership: routes + guard
 	friendCap   *int
 	httpClient  *http.Client
 	// verify authenticates a GitHub token → user. Defaults to verifyGitHub
@@ -118,6 +123,7 @@ func New(o Options) *Server {
 		readGuard:     o.ReadGuard,
 		hooks:         o.Hooks,
 		adminAuth:     o.AdminAuth,
+		membership:    o.Membership || membershipFromEnv(),
 		friendCap:     o.FriendCap,
 		httpClient:    &http.Client{Timeout: 10 * time.Second},
 		pairings:      map[string]pairing{},
@@ -135,6 +141,17 @@ func New(o Options) *Server {
 		s.metricsTokHash = sha256hex(metricsToken)
 	}
 	s.verify = s.verifyGitHub
+	// When membership is on, default the guards to the built-in roster guard
+	// (unless a downstream build supplied its own). The guard is content-blind
+	// and no-ops for unclaimed workspaces, so this never breaks the open default.
+	if s.membership {
+		if s.guard == nil {
+			s.guard = membershipGuard{store: s.store}
+		}
+		if s.readGuard == nil {
+			s.readGuard = membershipGuard{store: s.store}
+		}
+	}
 	return s
 }
 
@@ -169,6 +186,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/workspaces/{id}/presence", s.listPresence)
 	mux.HandleFunc("POST /v1/workspaces/{id}/keyring", s.publishKeyring)
 	mux.HandleFunc("GET /v1/workspaces/{id}/keyring", s.listKeyring)
+
+	// Relay-managed team membership (opt-in: Options.Membership / env). Off →
+	// these routes are unregistered (404), matching the plain content-blind relay.
+	if s.membership {
+		mux.HandleFunc("GET /v1/workspaces/{id}/members", s.membersList)
+		mux.HandleFunc("POST /v1/workspaces/{id}/members", s.memberUpsert)
+		mux.HandleFunc("DELETE /v1/workspaces/{id}/members/{account}", s.memberRemove)
+		mux.HandleFunc("POST /v1/workspaces/{id}/members/claim", s.membershipClaim)
+	}
 
 	mux.HandleFunc("POST /v1/pair", s.createPairing)
 	mux.HandleFunc("GET /v1/pair/{code}", s.resolvePairing)
