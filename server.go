@@ -194,6 +194,10 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("POST /v1/workspaces/{id}/members", s.memberUpsert)
 		mux.HandleFunc("DELETE /v1/workspaces/{id}/members/{account}", s.memberRemove)
 		mux.HandleFunc("POST /v1/workspaces/{id}/members/claim", s.membershipClaim)
+		mux.HandleFunc("POST /v1/workspaces/{id}/invites", s.inviteCreate)
+		mux.HandleFunc("GET /v1/workspaces/{id}/invites", s.invitesList)
+		mux.HandleFunc("DELETE /v1/workspaces/{id}/invites/{inviteId}", s.inviteRevoke)
+		mux.HandleFunc("POST /v1/workspaces/{id}/join", s.workspaceJoin)
 	}
 
 	mux.HandleFunc("POST /v1/pair", s.createPairing)

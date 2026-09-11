@@ -54,6 +54,14 @@ type wsSnap struct {
 	Keyring    []json.RawMessage          `json:"keyring"`
 	// Relay-managed team roster; absent from older snapshots (nil → unclaimed).
 	Members map[string]*MemberRow `json:"members,omitempty"`
+	// Relay-issued invites (id → invite + code hash); absent from older snapshots.
+	Invites map[string]inviteSnap `json:"invites,omitempty"`
+}
+
+// inviteSnap persists a memInvite (its unexported fields) in the JSON snapshot.
+type inviteSnap struct {
+	Row      InviteRow `json:"row"`
+	CodeHash string    `json:"codeHash"`
 }
 
 type dirSnap struct {
@@ -154,6 +162,10 @@ func (s *memoryStore) restore(snap snapshot) {
 		if ws.members == nil {
 			ws.members = map[string]*MemberRow{}
 		}
+		ws.invites = map[string]*memInvite{}
+		for id, iv := range w.Invites {
+			ws.invites[id] = &memInvite{row: iv.Row, codeHash: iv.CodeHash}
+		}
 		s.pruneEnvelopesLocked(ws, time.Now().Unix())
 		s.workspaces[id] = ws
 	}
@@ -235,11 +247,18 @@ func (s *memoryStore) toSnapshot() snapshot {
 		snap.Tokens[id] = tokenSnap{Rec: t.rec, Hash: t.hash}
 	}
 	for id, w := range s.workspaces {
-		snap.Workspaces[id] = wsSnap{
+		ws := wsSnap{
 			Envelopes: w.envelopes, EnvAt: w.envAt, EnvKey: w.envKey, NextSeq: w.nextSeq,
 			Candidates: w.candidates, Presence: w.presence, Keyring: w.keyring,
 			Members: w.members,
 		}
+		if len(w.invites) > 0 {
+			ws.Invites = map[string]inviteSnap{}
+			for invID, iv := range w.invites {
+				ws.Invites[invID] = inviteSnap{Row: iv.row, CodeHash: iv.codeHash}
+			}
+		}
+		snap.Workspaces[id] = ws
 	}
 	for k, d := range s.directory {
 		snap.Directory[k] = dirSnap{GitHubID: d.GitHubID, Login: d.Login, Name: d.Name, Devices: d.Devices}

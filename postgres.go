@@ -152,6 +152,19 @@ CREATE TABLE IF NOT EXISTS relay_workspace_members (
   added_at  BIGINT NOT NULL DEFAULT 0,
   PRIMARY KEY (workspace, account)
 );
+CREATE TABLE IF NOT EXISTS relay_workspace_invites (
+  workspace  TEXT   NOT NULL,
+  id         TEXT   NOT NULL,
+  code_hash  TEXT   NOT NULL,
+  role       TEXT   NOT NULL,
+  created_by TEXT   NOT NULL DEFAULT '',
+  expires_at BIGINT NOT NULL DEFAULT 0,
+  max_uses   INT    NOT NULL DEFAULT 0,
+  uses       INT    NOT NULL DEFAULT 0,
+  revoked    BOOLEAN NOT NULL DEFAULT FALSE,
+  PRIMARY KEY (workspace, id)
+);
+CREATE INDEX IF NOT EXISTS relay_invites_code ON relay_workspace_invites (workspace, code_hash);
 CREATE TABLE IF NOT EXISTS relay_directory (
   login     TEXT PRIMARY KEY,
   github_id BIGINT NOT NULL,
@@ -583,6 +596,60 @@ func (s *postgresStore) MemberRole(ctx context.Context, workspace, account strin
 	err := s.pool.QueryRow(ctx,
 		`SELECT role FROM relay_workspace_members WHERE workspace = $1 AND account = $2`,
 		workspace, account).Scan(&role)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return role, true, nil
+}
+
+func (s *postgresStore) CreateInvite(ctx context.Context, workspace, id, codeHash, role, createdBy string, expiresAt int64, maxUses int, _ int64) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO relay_workspace_invites (workspace, id, code_hash, role, created_by, expires_at, max_uses)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		workspace, id, codeHash, role, createdBy, expiresAt, maxUses)
+	return err
+}
+
+func (s *postgresStore) ListInvites(ctx context.Context, workspace string) ([]InviteRow, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, role, created_by, expires_at, max_uses, uses, revoked
+		 FROM relay_workspace_invites WHERE workspace = $1 ORDER BY id`, workspace)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []InviteRow{}
+	for rows.Next() {
+		var i InviteRow
+		if err := rows.Scan(&i.ID, &i.Role, &i.CreatedBy, &i.ExpiresAt, &i.MaxUses, &i.Uses, &i.Revoked); err != nil {
+			return nil, err
+		}
+		out = append(out, i)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) RevokeInvite(ctx context.Context, workspace, id string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE relay_workspace_invites SET revoked = TRUE WHERE workspace = $1 AND id = $2`, workspace, id)
+	return err
+}
+
+func (s *postgresStore) RedeemInvite(ctx context.Context, workspace, codeHash string, now int64) (string, bool, error) {
+	// Atomic redeem: bump uses + return role only if a live invite matches
+	// (not revoked, not expired, under its use cap). The single UPDATE ... RETURNING
+	// makes concurrent redemptions of a use-capped invite race-safe.
+	var role string
+	err := s.pool.QueryRow(ctx,
+		`UPDATE relay_workspace_invites SET uses = uses + 1
+		 WHERE workspace = $1 AND code_hash = $2 AND revoked = FALSE
+		   AND (expires_at = 0 OR expires_at > $3)
+		   AND (max_uses = 0 OR uses < max_uses)
+		 RETURNING role`,
+		workspace, codeHash, now).Scan(&role)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return "", false, nil

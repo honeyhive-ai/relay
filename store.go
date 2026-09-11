@@ -232,6 +232,15 @@ type Store interface {
 	RemoveMember(ctx context.Context, workspace, account string) error
 	MemberRole(ctx context.Context, workspace, account string) (string, bool, error)
 
+	// Relay-issued workspace invites (revocable/expiring/use-capped self-enroll).
+	// The relay stores only the invite's code hash + coarse role + counters.
+	// RedeemInvite validates a code hash against a live invite, bumps its use
+	// count, and returns the role to enroll the caller at (ok=false if none live).
+	CreateInvite(ctx context.Context, workspace, id, codeHash, role, createdBy string, expiresAt int64, maxUses int, now int64) error
+	ListInvites(ctx context.Context, workspace string) ([]InviteRow, error)
+	RevokeInvite(ctx context.Context, workspace, id string) error
+	RedeemInvite(ctx context.Context, workspace, codeHash string, now int64) (string, bool, error)
+
 	// Identity directory (invite-by-handle, seal-to-all-devices).
 	UpsertDirDevice(ctx context.Context, githubID uint64, login string, name *string, deviceID, kaPub string) error
 	DirAccountByHandle(ctx context.Context, handle string) (*DirAccount, error)
