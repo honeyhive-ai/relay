@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -194,3 +195,42 @@ func TestMembershipDisabledRoutes404(t *testing.T) {
 		t.Fatalf("members route should be 404 when membership disabled, got %d", code)
 	}
 }
+
+// The identity verifier lets teams run on an OPEN relay: collaboration stays
+// open (no token needed), but a signed identity token is read for membership so
+// a *claimed* workspace still enforces — without fail-closing tokenless clients.
+func TestMembershipOnOpenRelayViaIdentityKey(t *testing.T) {
+	sk := testKey(t)
+	pub := sk.Public().(ed25519.PublicKey)
+	t.Setenv("HIVE_RELAY_MEMBERSHIP_PUBKEY", hexEncode(pub))
+	srv := New(Options{
+		Store:       newMemoryStore(),
+		Entitlement: entitlementPolicy{kind: entOpen}, // OPEN — no entitlement token required
+		Membership:  true,
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	wsBase := ts.URL + "/v1/workspaces/wsOpen"
+	owner := issueToken(sk, TokenClaims{Sub: "github:1"})
+
+	// Tokenless writes to an UNCLAIMED workspace stay open (collaboration intact).
+	if code, _ := req(t, "POST", wsBase+"/envelopes", "", json.RawMessage(`{"x":1}`)); code != http.StatusOK {
+		t.Fatalf("open relay unclaimed write should stay 200, got %d", code)
+	}
+	// An identified owner claims a DIFFERENT workspace.
+	claimBase := ts.URL + "/v1/workspaces/wsClaimed"
+	if code, _ := req(t, "POST", claimBase+"/members/claim", owner, nil); code != http.StatusOK {
+		t.Fatalf("claim via identity token want 200, got %d", code)
+	}
+	// Now a tokenless write to the CLAIMED workspace is rejected (enforced)…
+	if code, _ := req(t, "POST", claimBase+"/envelopes", "", json.RawMessage(`{"x":1}`)); code != http.StatusForbidden {
+		t.Fatalf("claimed workspace tokenless write want 403, got %d", code)
+	}
+	// …while the owner (identified) can write.
+	if code, _ := req(t, "POST", claimBase+"/envelopes", owner, json.RawMessage(`{"x":1}`)); code != http.StatusOK {
+		t.Fatalf("owner write to claimed workspace want 200, got %d", code)
+	}
+}
+
+func hexEncode(b []byte) string { return hex.EncodeToString(b) }

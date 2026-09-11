@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -74,8 +75,14 @@ type Server struct {
 	hooks       Hooks           // nil = no-op
 	adminAuth   AdminAuthorizer // nil = admin API disabled
 	membership  bool            // relay-managed team membership: routes + guard
-	friendCap   *int
-	httpClient  *http.Client
+	// Optional signed-identity verifier for membership (HIVE_RELAY_MEMBERSHIP_PUBKEY).
+	// Decoupled from the entitlement gate: it lets the relay read a caller's
+	// identity (a signed hrt1 token's Sub) for membership enforcement WITHOUT
+	// forcing the entitlement to entSigned — so teams can run on an OPEN relay
+	// (collaboration stays open; only claimed workspaces require a member token).
+	memberVerifier ed25519.PublicKey
+	friendCap      *int
+	httpClient     *http.Client
 	// verify authenticates a GitHub token → user. Defaults to verifyGitHub
 	// (a live api.github.com call); tests override it.
 	verify func(ctx context.Context, token string) (*githubUser, error)
@@ -150,6 +157,14 @@ func New(o Options) *Server {
 		}
 		if s.readGuard == nil {
 			s.readGuard = membershipGuard{store: s.store}
+		}
+		// Optional identity verifier, independent of the entitlement policy.
+		if pk := strings.TrimSpace(os.Getenv("HIVE_RELAY_MEMBERSHIP_PUBKEY")); pk != "" {
+			if vk, ok := parsePubkey(pk); ok {
+				s.memberVerifier = vk
+			} else {
+				os.Stderr.WriteString("HIVE_RELAY_MEMBERSHIP_PUBKEY set but unparseable; ignoring\n")
+			}
 		}
 	}
 	return s
@@ -247,6 +262,15 @@ func (s *Server) gate(next http.Handler) http.Handler {
 		if !ok {
 			http.Error(w, "relay requires a valid access token", http.StatusUnauthorized)
 			return
+		}
+		// If the entitlement carried no identity (e.g. the open policy) but a
+		// membership identity key is configured, try to read a signed identity
+		// from the same bearer — so membership can enforce per-caller without the
+		// entitlement gate having to fail-close every tokenless client.
+		if claims == nil && s.memberVerifier != nil {
+			if c, valid := verifyToken(bearerToken(r), s.memberVerifier); valid && (c.Exp == 0 || int64(c.Exp) > nowUnix()) {
+				claims = &c
+			}
 		}
 		if claims != nil {
 			r = r.WithContext(context.WithValue(r.Context(), claimsCtxKey{}, claims))
