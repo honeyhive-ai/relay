@@ -39,6 +39,9 @@ func Main() {
 		case "issue":
 			fatalIf(cmdIssue(args[1:]))
 			return
+		case "bootstrap-agent":
+			fatalIf(cmdBootstrapAgent(args[1:]))
+			return
 		case "help", "--help", "-h":
 			printUsage()
 			return

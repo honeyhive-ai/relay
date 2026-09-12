@@ -1,11 +1,14 @@
 package relay
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -25,6 +28,11 @@ Generate an issuer keypair: hive-relay keygen
 Mint an entitlement token:  hive-relay issue --key <priv-hex> --sub <id> \
                               [--plan team] [--exp-days 365] [--max-members 50] \
                               [--turn] [--cap remove_member --cap rotate_key]
+Bootstrap a remote agent:   hive-relay bootstrap-agent --key <priv-hex> \
+                              --relay <url> --room <room> --ws-key <passphrase> \
+                              --sub github:<agent-id> --admin-sub github:<owner-id> \
+                              [--role contributor] [--label agent] [--exp-days 365]
+                            → prints one copy-paste line the dev runs on the box.
 
 Set the relay's HIVE_RELAY_TOKEN_PUBKEY to the keygen public key; keep the
 private key with your issuer backend only.
@@ -100,6 +108,106 @@ func cmdIssue(args []string) error {
 		claims.Exp = uint64(time.Now().Unix()) + uint64(expDays)*86_400
 	}
 	fmt.Println(issueToken(priv, claims))
+	return nil
+}
+
+// cmdBootstrapAgent generates a single copy-paste command that stands up a
+// headless agent on a remote box. It mints the agent's identity token, best-
+// effort enrolls it in the workspace roster (with --admin-sub), and assembles
+// the `hivews1:` connection invite — then prints one `brew … && hive enroll …
+// && hive worker …` line the developer runs verbatim. The issuer private key
+// stays here (the issuer backend); only the minted agent token leaves.
+func cmdBootstrapAgent(args []string) error {
+	var keyHex, relay, room, wsKey, sub, adminSub, label string
+	role := "contributor"
+	var expDays int64 = 365
+	for i := 0; i < len(args); i++ {
+		next := func() string {
+			if i+1 < len(args) {
+				i++
+				return args[i]
+			}
+			return ""
+		}
+		switch args[i] {
+		case "--key":
+			keyHex = next()
+		case "--relay":
+			relay = next()
+		case "--room":
+			room = next()
+		case "--ws-key":
+			wsKey = next()
+		case "--sub":
+			sub = next()
+		case "--admin-sub":
+			adminSub = next()
+		case "--role":
+			role = next()
+		case "--label":
+			label = next()
+		case "--exp-days":
+			expDays, _ = strconv.ParseInt(next(), 10, 64)
+		default:
+			return fmt.Errorf("unknown flag %s (try `hive-relay help`)", args[i])
+		}
+	}
+	priv, ok := parseSigningKey(keyHex)
+	if !ok {
+		return fmt.Errorf("--key must be a 64-char hex Ed25519 seed (from `keygen`)")
+	}
+	if relay == "" || room == "" || sub == "" {
+		return fmt.Errorf("--relay, --room, and --sub are required")
+	}
+	if label == "" {
+		label = strings.NewReplacer(":", "-", "/", "-").Replace(sub)
+	}
+	now := time.Now().Unix()
+	relay = strings.TrimRight(relay, "/")
+
+	// Best-effort: enroll the agent in the roster via a transient admin token.
+	enrolled := false
+	if adminSub != "" {
+		adminTok := issueToken(priv, TokenClaims{Sub: adminSub, Exp: uint64(now) + 3600})
+		body, _ := json.Marshal(map[string]string{"account": sub, "login": "", "role": role})
+		req, _ := http.NewRequest(http.MethodPost, relay+"/v1/workspaces/"+room+"/members", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+adminTok)
+		req.Header.Set("Content-Type", "application/json")
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+			enrolled = resp.StatusCode == http.StatusOK
+		}
+	}
+
+	// Mint the agent's identity token.
+	claims := TokenClaims{Sub: sub, Plan: "agent", Caps: []string{}}
+	if expDays >= 0 {
+		claims.Exp = uint64(now) + uint64(expDays)*86_400
+	}
+	tok := issueToken(priv, claims)
+
+	// Assemble the hivews1 connection invite (snake_case, matching the app).
+	conn := map[string]string{"relay_url": relay, "room": room}
+	if wsKey != "" {
+		conn["key"] = wsKey
+	}
+	cj, _ := json.Marshal(conn)
+	invite := "hivews1:" + base64.RawURLEncoding.EncodeToString(cj)
+
+	// The one line the developer pastes on the remote box.
+	fmt.Println("# Run on the remote agent box:")
+	fmt.Printf("brew install honeyhive-ai/hive/hive-cli && \\\n")
+	fmt.Printf("  hive enroll %q --token %q && \\\n", invite, tok)
+	fmt.Printf("  hive worker --label %s\n", label)
+
+	switch {
+	case adminSub != "" && enrolled:
+		fmt.Fprintf(os.Stderr, "\n# Enrolled %s as %s in %s.\n", sub, role, room)
+	case adminSub != "":
+		fmt.Fprintf(os.Stderr, "\n# NOTE: roster enrollment failed — is --admin-sub an owner/admin and the workspace claimed? Add %s via the People pane, or run `hive join <code>` on the box.\n", sub)
+	default:
+		fmt.Fprintf(os.Stderr, "\n# NOTE: pass --admin-sub <owner-id> to auto-enroll, or add %s via the People pane. Without roster membership, writes to a claimed workspace are refused.\n", sub)
+	}
 	return nil
 }
 
