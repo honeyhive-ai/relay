@@ -138,6 +138,7 @@ type hostCtl struct {
 	hostID string
 	conn   *tconn
 	gone   chan struct{}
+	poke   chan struct{} // buffered 1: re-check status now (RefreshTunnelStatus)
 }
 
 type pendingOpen struct {
@@ -532,11 +533,12 @@ func (h *tunnelHub) admitHost(ctx context.Context, m *relayMsg, nonce []byte) (*
 	if err := h.store.UpsertTunnelHost(ctx, *rec); err != nil {
 		return nil, terr(tcInternal, "store unavailable")
 	}
-	return &hostCtl{hostID: m.HostID, gone: make(chan struct{})}, nil
+	return &hostCtl{hostID: m.HostID, gone: make(chan struct{}), poke: make(chan struct{}, 1)}, nil
 }
 
-// watchStatus re-checks entitlement every StatusTTL, tells the host when it
-// changes and refreshes last_seen (for pending-host GC).
+// watchStatus re-checks entitlement every StatusTTL (or at once when poked by
+// refreshStatus), tells the host when it changes and refreshes last_seen (for
+// pending-host GC).
 func (h *tunnelHub) watchStatus(ctl *hostCtl, last HostStatus, stop <-chan struct{}) {
 	tick := time.NewTicker(h.lim.StatusTTL)
 	defer tick.Stop()
@@ -545,19 +547,35 @@ func (h *tunnelHub) watchStatus(ctl *hostCtl, last HostStatus, stop <-chan struc
 		case <-stop:
 			return
 		case <-tick.C:
-			st, err := h.hostStatus(context.Background(), ctl.hostID, true)
-			if err != nil {
-				ctl.conn.fail(tcUnauthorized, "host is no longer admitted by this relay")
-				return
-			}
-			if st.Active != last.Active {
-				_ = ctl.conn.writeJSON(map[string]any{"t": "status", "status": statusString(st)})
-			}
-			last = st
-			if rec, err := h.store.TunnelHost(context.Background(), ctl.hostID); err == nil && rec != nil {
-				rec.LastSeen, rec.Active = h.nowUnix(), st.Active
-				_ = h.store.UpsertTunnelHost(context.Background(), *rec)
-			}
+		case <-ctl.poke:
+		}
+		st, err := h.hostStatus(context.Background(), ctl.hostID, true)
+		if err != nil {
+			ctl.conn.fail(tcUnauthorized, "host is no longer admitted by this relay")
+			return
+		}
+		if st.Active != last.Active {
+			_ = ctl.conn.writeJSON(map[string]any{"t": "status", "status": statusString(st)})
+		}
+		last = st
+		if rec, err := h.store.TunnelHost(context.Background(), ctl.hostID); err == nil && rec != nil {
+			rec.LastSeen, rec.Active = h.nowUnix(), st.Active
+			_ = h.store.UpsertTunnelHost(context.Background(), *rec)
+		}
+	}
+}
+
+// refreshStatus drops the cached status for hostID and pokes its control
+// connection, if any, to re-check now.
+func (h *tunnelHub) refreshStatus(hostID string) {
+	h.mu.Lock()
+	delete(h.status, hostID)
+	ctl := h.hosts[hostID]
+	h.mu.Unlock()
+	if ctl != nil {
+		select {
+		case ctl.poke <- struct{}{}:
+		default: // a re-check is already queued
 		}
 	}
 }

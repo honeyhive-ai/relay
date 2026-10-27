@@ -274,6 +274,18 @@ func (s *Server) Handler() http.Handler {
 	return m.observe(s.gate(mux))
 }
 
+// RefreshTunnelStatus tells the relay that hostID's TunnelPolicy status may
+// have changed (for example, a hosted build bound a purchase to it). The cached
+// status is dropped, so the next phone connect asks the policy again, and a
+// connected host is re-checked at once and sent {"t":"status"} if it changed.
+// Without this, a change takes effect within the 60 s status cache. A no-op
+// when the tunnel is off; safe from any goroutine.
+func (s *Server) RefreshTunnelStatus(hostID string) {
+	if s.tunnel != nil {
+		s.tunnel.refreshStatus(hostID)
+	}
+}
+
 // ShutdownTunnels closes every tunnel WebSocket with shutting_down (4011) and
 // stops tunnel housekeeping. Wire it to http.Server.RegisterOnShutdown: hijacked
 // connections aren't closed by http.Server.Shutdown.

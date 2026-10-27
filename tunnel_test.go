@@ -1172,3 +1172,31 @@ func TestTunnel_Backpressure(t *testing.T) {
 		}
 	}
 }
+
+// RefreshTunnelStatus applies a policy change at once (no StatusTTL wait): the
+// connected host gets {"t":"status"} and the next phone connect is admitted.
+func TestTunnel_RefreshTunnelStatus(t *testing.T) {
+	pol := &stubPolicy{st: HostStatus{Active: false}}
+	env := newTunnelEnv(t, pol, nil, nil) // default StatusTTL: 60 s
+	h := newFakeHost(t, env)
+	if w := h.connect(); w["status"] != "pending" {
+		t.Fatalf("welcome: %v", w)
+	}
+	p := newFakePhone()
+	now := time.Now().Unix()
+	expectClose(t, p.connect(t, env, h.id, h.cred(p.pid, p.pub(), now, now+86400), nil), 4006)
+
+	pol.mu.Lock()
+	pol.st = HostStatus{Active: true}
+	pol.mu.Unlock()
+	env.srv.RefreshTunnelStatus(h.id)
+	if s := h.next("status"); s["status"] != "active" {
+		t.Fatalf("status: %v", s)
+	}
+	session(t, env, h, p)
+
+	// Unknown host ids and repeated calls are harmless.
+	env.srv.RefreshTunnelStatus("AAAAAAAAAAAAAAAAAAAAAA")
+	env.srv.RefreshTunnelStatus(h.id)
+	env.srv.RefreshTunnelStatus(h.id)
+}
