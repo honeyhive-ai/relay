@@ -69,6 +69,9 @@ type memoryStore struct {
 	// notify wakes SSE subscribers of this workspace on a genuinely new append
 	// (in-process; see wsNotifier).
 	notify *wsNotifier
+
+	// Relay tunnel state (hosts, revocations, push tokens); see tunnel_store.go.
+	*memTunnel
 }
 
 type memToken struct {
@@ -134,6 +137,7 @@ func newMemoryStore() *memoryStore {
 		maxKeyringPerWS:       int(envInt64("HIVE_RELAY_MAX_KEYRING_PER_WS", defaultMaxKeyringPerWS)),
 		maxDeviceBlobsPerWS:   int(envInt64("HIVE_RELAY_MAX_DEVICE_BLOBS_PER_WS", defaultMaxDeviceBlobsPerWS)),
 		notify:                newWSNotifier(),
+		memTunnel:             newMemTunnel(),
 	}
 }
 

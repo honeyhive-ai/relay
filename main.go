@@ -82,6 +82,9 @@ func Main() {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	// Tunnel WebSockets are hijacked (Shutdown doesn't see them): close them
+	// with shutting_down so clients reconnect with backoff.
+	httpServer.RegisterOnShutdown(srv.ShutdownTunnels)
 
 	// Stop on Ctrl-C or SIGTERM (a redeploy from the orchestrator).
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

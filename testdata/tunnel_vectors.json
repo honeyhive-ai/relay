@@ -1,0 +1,115 @@
+{
+  "challenge": {
+    "hostAuthInputHex": "686976652d74756e6e656c2f3120686f73742d6175746800324c475a466a326c434b6c6f34395f7077507a476a77656a6bf61eb8d27578d492910dd301ab080708bd49762867033d0f49f68ad54a",
+    "hostAuthSig": "fS4IpEFE3U1bf0XZje2XpsHYTVvLrjDpwDb07ABBY4MH-si_L2bFp2-CZ9G6aM5F4-EeczNGEckEt5VpX9mUCA",
+    "nonce": "ZWpr9h640nV41JKRDdMBqwgHCL1JdihnAz0PSfaK1Uo",
+    "phoneAuthInputHex": "686976652d74756e6e656c2f312070686f6e652d6175746800324c475a466a326c434b6c6f34395f7077507a476a77656a6bf61eb8d27578d492910dd301ab080708bd49762867033d0f49f68ad54a",
+    "phoneAuthSig": "1jNuSxpjnu_tT0F40r8CErhcZhN-ARQRTLFK2kDqZs1oV0r_IY5mZyTzvhcyriG8lXDQyvQHdEWPyU4uvKHGAA"
+  },
+  "credential": {
+    "claimsJson": "{\"hid\":\"2LGZFj2lCKlo49_pwPzGjw\",\"pid\":\"lg7S2X1oS18S3AUMgTzRgQ\",\"pk\":\"RijP-yjgXRWsx512FVYYmhNMhjSzvdThoJkB_8PkVBg\",\"iat\":1793000000,\"exp\":1800776000}",
+    "token": "hpc1.eyJoaWQiOiIyTEdaRmoybENLbG80OV9wd1B6R2p3IiwicGlkIjoibGc3UzJYMW9TMThTM0FVTWdUelJnUSIsInBrIjoiUmlqUC15amdYUldzeDUxMkZWWVltaE5NaGpTenZkVGhvSmtCXzhQa1ZCZyIsImlhdCI6MTc5MzAwMDAwMCwiZXhwIjoxODAwNzc2MDAwfQ.oJtJO6INvlMaCaTXDr1QEVPCut-MbXb9YkBh-xXO18JXJ561mYm-PTL4HWAwOJ71dBUd77MOGt_x_rou-s1gBw"
+  },
+  "enrollment": {
+    "protocol": "Noise_IKpsk1_25519_ChaChaPoly_SHA256",
+    "prologueHex": "686976652d74756e6e656c2f31206e6f69736500324c475a466a326c434b6c6f34395f7077507a476a77",
+    "pskHex": "873d5e526ba65f754b1017ea9228814134082a2596e051603caadee1098ec7d1",
+    "phoneEphemeralPrivHex": "288fe45642b0576464e0e40075a7c816d7182aaf0a8b9bd28b709149baf2c4a0",
+    "hostEphemeralPrivHex": "50b55fa71d894eb9f15f73d83087440b5a6701231e2d40b6b978e5d29f7f33d2",
+    "msg1Payload": "{\"v\":1,\"name\":\"Test iPhone\",\"pk\":\"RijP-yjgXRWsx512FVYYmhNMhjSzvdThoJkB_8PkVBg\"}",
+    "msg1Hex": "2e54fe41943bcacec3aca34bcc4b354bcbc673921963c95afca64fb14d53315dc7337c66c8ced28c5e3be1f64db7b0fc862cde7f965af62af333c97d1e3af5d766a74c135109a0cfd6dc2e8a24d8713ddb66608344a76a24d2bf65dd54ae352904e1a3cf37afaa2f9faf346c854d109024f636ccfdc8dfc2b37042e92ef9e20813975d00127ad06bb0c8bb1b29ea34e56c0d348fb51ed267b693d15a4a564cba4b1d6361687591d2a1f52c3f74ccb0",
+    "msg2Payload": "{\"v\":1,\"pid\":\"lg7S2X1oS18S3AUMgTzRgQ\",\"cred\":\"hpc1.eyJoaWQiOiIyTEdaRmoybENLbG80OV9wd1B6R2p3IiwicGlkIjoibGc3UzJYMW9TMThTM0FVTWdUelJnUSIsInBrIjoiUmlqUC15amdYUldzeDUxMkZWWVltaE5NaGpTenZkVGhvSmtCXzhQa1ZCZyIsImlhdCI6MTc5MzAwMDAwMCwiZXhwIjoxODAwNzc2MDAwfQ.oJtJO6INvlMaCaTXDr1QEVPCut-MbXb9YkBh-xXO18JXJ561mYm-PTL4HWAwOJ71dBUd77MOGt_x_rou-s1gBw\"}",
+    "msg2Hex": "04e55feb76d3f305a0535bacf65b2fee1d611e73e1654cc694f2dfa48b72ba6f6ae6bc773b80b03188bfb55d5269e839498eb51d8163412db5a0b116baf52fe4f7063675e975c6a8f27b403b09c0e3067ed590d1eb39853c28ca9e435b248958b5db2ea86961d5f0df60990c94e6d488a555c722e3d17817fc625b61f72e0694d2941cbb4fc80bce16bfea4c05399f08ab72db5d41a641af4ba6a79c03ad6aa0f3c9f1c0bca404f5c7484dda98b6389268dec676b992de15538ed409174acdca2511caa95fb9889141619a3dd4c81dc725b397ad0a22a43f956ac545c4fc2e85cc3042548c6ae1397e4d8820e39b2e51bae5b6a439af898646d893bb0909056d15eed6e0e4f6f23af44cb6d360c2f810ac3bbc4c10602eaf0c6ff041a16d6781fe5c54a773f06dc17c5b5c27a5d278cc981a33cd608e175e5a402ac9368094829a1d1d9a93d5d256220b07bb9b3e6643c47159fb9115fda0bccebb133835e0b7c1c0b21639cf305f38445afac0855aac5af4a42048bddaaf47a44efa53be91d71076",
+    "handshakeHashHex": "c51882c16c2b86d27ec02596536ab9e0c836ac4a95a32f36811b4a3f0c29bf90",
+    "transport": [
+      {
+        "dir": "phone->host",
+        "plaintextHex": "07000000000001020304050607",
+        "note": "PING stream 0 (confirms enrollment)",
+        "wireHex": "cd736a20d26842c9c03689357b7fc6dcf63e58868554c40226820e819e"
+      },
+      {
+        "dir": "host->phone",
+        "plaintextHex": "08000000000001020304050607",
+        "note": "PONG stream 0",
+        "wireHex": "61c662abeacc8631216e3cf51ef761ee2273cf7cc36ddf7c5ba0dccd32"
+      }
+    ],
+    "pushKeyHex": "ebe7ca7ebff1601b1cbda4d7ebb1f4620c9c73bdb411a41592d32a7ea1f4e0c9"
+  },
+  "hostId": "2LGZFj2lCKlo49_pwPzGjw",
+  "keys": {
+    "hostSignPub": "3oc6DpoUCvgNiIRqRobjLj2vcsV3Alg7LviqN-mBGzY",
+    "hostSignSeedHex": "d798e66f8e3bd9cb5cbf310372ba535a8ef1f84523c85723da15ad27e194d4d5",
+    "hostStaticPrivHex": "99320988dbe12a64dc171a75a4b826a09e21dcc247112d2eb18368423fac1501",
+    "hostStaticPub": "rX2_Zzy_XPP_rKyNHdO0tEeMyKpm054V5n1xdD_gFzo",
+    "phoneAuthPub": "RijP-yjgXRWsx512FVYYmhNMhjSzvdThoJkB_8PkVBg",
+    "phoneAuthSeedHex": "775cbfdd77862b16ff3786d2a54e251c251a6e7e06cc4cc84e8bd60c1227b888",
+    "phoneStaticPrivHex": "6ae503b941daf3c921b0e408cdf28be171beb6b357a64e5f449ac59985f952c8",
+    "phoneStaticPub": "tsMFdqj4UpBPDOK03mAPJdBazBEOFz6tymct8CGS9zs"
+  },
+  "negative": {
+    "credentialTamperedClaims": "hpc1.eyJoaWQiOiIyTEdaRmoybENLbG80OV9wd1B6R2p3IiwicGlkIjoibGc3UzJYMW9TMThTM0FVTWdUelJnUSIsInBrIjoiUmlqUC15amdYUldzeDUxMkZWWVltaE5NaGpTenZkVGhvSmtCXzhQa1ZCZyIsImlhdCI6MTc5MzAwMDAwMCwiZXhwIjoxOTAwNzc2MDAwfQ.oJtJO6INvlMaCaTXDr1QEVPCut-MbXb9YkBh-xXO18JXJ561mYm-PTL4HWAwOJ71dBUd77MOGt_x_rou-s1gBw",
+    "sessionMsg1OtherHostPrologueHex": "f94ae1bd0f2a78ffdad916b0f3be00f44d1ac74cd188b81a66fb3309aca4567f54652566084b23b56a8c439470d64784b611cc0bc72d61524c282ce15dc58a4cfa4ef24adebc36a2afd72c524abf56e96030c4698c676a1a6fdffab377e274c2f70452431ec2c2",
+    "sessionMsg2TamperedHex": "c10770f5353883cdcd57b76e5e511143e3c4b0716aee99e7973833e1f8f8ff5eb9da375b1d90bcbe9e0473e71ade943811833aa27752cd"
+  },
+  "pairing": {
+    "eid": "BfvmfuXlCrp5KGmnwVxzgg",
+    "link": "hive://pair?url=aHR0cDovLzEwMC4xMDEuMTAyLjEwNDo4Nzg3&token=4f1c0de5a1b2c3d4e5f60718293a4b5c6d7e8f9011223344556677889900aabb&v=2&hid=2LGZFj2lCKlo49_pwPzGjw&hs=rX2_Zzy_XPP_rKyNHdO0tEeMyKpm054V5n1xdD_gFzo&relay=aHR0cHM6Ly9yZWxheS5leGFtcGxlLmNvbQ&ps=GGzSn9ODtHFtphJFAOvwhBIns8-YMbiqpMRV0K2kWAI&exp=1793000600",
+    "pairingSecret": "GGzSn9ODtHFtphJFAOvwhBIns8-YMbiqpMRV0K2kWAI",
+    "pskHex": "873d5e526ba65f754b1017ea9228814134082a2596e051603caadee1098ec7d1",
+    "tag": "GLcxYur31MX5y25s4exOCV9H01vu34Q6a7pn1RQE5Vc",
+    "tagHash": "9q4HJQHmMA7uuIHbUL93Qe2tXI0LYC1oldac4UBqujI"
+  },
+  "pid": "lg7S2X1oS18S3AUMgTzRgQ",
+  "push": {
+    "adHex": "686976652d74756e6e656c2f31207075736800324c475a466a326c434b6c6f34395f7077507a476a776c6737533258316f533138533341554d67547a526751",
+    "ct": "wMMNw5lbSaJv4Nh7IE-0rOVmurMNjWUiv0RyCFzuhi9GH4Z2Gc1yOLx-k7A6fAdHx9ceEkFQGtrFTaxp3FAb381OvI_VcReic0HLZan1etLhtFIQ4g5NI8b47wh8CZDecARgyEQuOvLSYZZ6zXfSBHGlsClMUADCZJQ7PPhfhs5FJRTPpwA_iWmp_M3nNoBEKUdAnvi2JOsgJ_W_LSMKLKymy0QJnzSTUcSMtOD8Vw",
+    "nonceHex": "c0c30dc3995b49a26fe0d87b",
+    "plaintext": "{\"v\":1,\"seq\":1,\"ts\":1793000100,\"kind\":\"message.done\",\"chatId\":\"5b0e8c1e-2f39-4d55-9a57-0b7f6f3f1c11\",\"title\":\"coder\",\"body\":\"Done: all tests pass\"}"
+  },
+  "session": {
+    "protocol": "Noise_IK_25519_ChaChaPoly_SHA256",
+    "prologueHex": "686976652d74756e6e656c2f31206e6f69736500324c475a466a326c434b6c6f34395f7077507a476a77",
+    "phoneEphemeralPrivHex": "1fc2ac84acfb4e0445f8ba9c06f8ad26e15366a22ee0e5a056537610a21549fc",
+    "hostEphemeralPrivHex": "8557cb16063aa4e53e6ac771e0f9fb7ed66d2e1fd45794cf80f2338775572fe0",
+    "msg1Payload": "{\"v\":1}",
+    "msg1Hex": "f94ae1bd0f2a78ffdad916b0f3be00f44d1ac74cd188b81a66fb3309aca4567f54652566084b23b56a8c439470d64784b611cc0bc72d61524c282ce15dc58a4c5e6106cc539475ccc346bbe3f4ccd2a76030c4698c676a18160e099c62143a64eee01181de901b",
+    "msg2Payload": "{\"v\":1}",
+    "msg2Hex": "c10770f5353883cdcd57b76e5e511143e3c4b0716aee99e7973833e1f8f8ff5eb9da375b1d90bcbe9e0473e71ade943811833aa27752cc",
+    "handshakeHashHex": "dd28b3b490545a2886c6063d215d86d7643da78c943a2fa7734e62ac10d02d77",
+    "transport": [
+      {
+        "dir": "phone->host",
+        "plaintextHex": "01000000017b226d6574686f64223a22474554222c2270617468223a222f76312f6865616c7468222c2268656164657273223a5b5b22616363657074222c226170706c69636174696f6e2f6a736f6e225d5d7d",
+        "note": "OPEN stream 1 {\"method\":\"GET\",\"path\":\"/v1/health\",\"headers\":[[\"accept\",\"application/json\"]]}",
+        "wireHex": "5b3ee7e192f8e92d0b6c333ae0539f6388e153701eeb8ccc56dd0b2457a9147c6b8f7f3a1b2b54d9e0f7a4fee2759eabdafd481f4ce7de04219bb32500ab97f889ab305c3848771881d06d3fd3075e5f2472b23a40e8701a1ca51be0581d106ac9bf55"
+      },
+      {
+        "dir": "phone->host",
+        "plaintextHex": "0300000001",
+        "note": "FIN stream 1",
+        "wireHex": "13e447e3098e68de48768691500f6b0b6a2b0457d2"
+      },
+      {
+        "dir": "host->phone",
+        "plaintextHex": "05000000017b22737461747573223a3230302c2268656164657273223a5b5b22636f6e74656e742d74797065222c226170706c69636174696f6e2f6a736f6e225d5d7d",
+        "note": "RESPONSE stream 1 {\"status\":200,\"headers\":[[\"content-type\",\"application/json\"]]}",
+        "wireHex": "73c3aff7c2023ecc775781e270027b4c94e99f3be2e1ad8de20be1e6cc2d4dd3e0cc10994031c811d91e630046381d89b0d4bd638b741a06c1df3cbbe87d6706d8837849636dfef449556ce9effc6474979a7a"
+      },
+      {
+        "dir": "host->phone",
+        "plaintextHex": "02000000017b226f6b223a747275652c2276657273696f6e223a22312e31352e30227d",
+        "note": "DATA stream 1 {\"ok\":true,\"version\":\"1.15.0\"}",
+        "wireHex": "4b316ea965268ba2a72f82a851711e0934a5c0a80c885755aadf98944ccc44fd20b1741b6d3d6145ec06ec3340c7aed6acb8fa"
+      },
+      {
+        "dir": "host->phone",
+        "plaintextHex": "0300000001",
+        "note": "FIN stream 1",
+        "wireHex": "834002314f95f60af91ee3602087cfae2aa8ba7bb1"
+      }
+    ]
+  },
+  "version": "hive-tunnel/1"
+}

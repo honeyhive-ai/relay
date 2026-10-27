@@ -41,6 +41,8 @@ hive-relay issue --key <priv-hex> --sub <id> --plan team --exp-days 365 \
 | `HIVE_RELAY_MAX_ENVELOPES` | per-workspace retained-envelope cap for the memory store (default `50000`; `0` = unbounded) |
 | `HIVE_RELAY_RETENTION_DAYS` | prune memory-store envelopes older than N days (default `0` = age pruning off) |
 | `HIVE_RELAY_MAX_BODY_BYTES` | max JSON request-body size in bytes (default `4194304` = 4 MiB) |
+| `HIVE_RELAY_TUNNEL` | relay tunnel (phone ↔ home host): `off` (**default**, `/v1/tunnel/*` → 404), `open` (any host may register), `allowlist` (only `HIVE_RELAY_TUNNEL_HOSTS`). See [Relay tunnel](#relay-tunnel-hive-tunnel1) |
+| `HIVE_RELAY_TUNNEL_HOSTS` | comma-separated `host_id`s admitted when `HIVE_RELAY_TUNNEL=allowlist` |
 
 Storage selection: `DATABASE_URL` → Postgres; else `HIVE_RELAY_DATA_DIR` →
 memory+snapshot; else in-memory only.
@@ -183,6 +185,56 @@ human who opens the URL sees an intentional page rather than a `401`. `GET
 is unreachable — wire it to your orchestrator's liveness/readiness probe.
 Everything else is token-gated.
 
+### Relay tunnel (`hive-tunnel/1`)
+
+Lets the Hive iPhone app reach a `hive serve` home host through the relay —
+no VPN, no inbound port on the host. The relay checks **who may connect** and
+then forwards opaque bytes: phone and host run a Noise IK session end to end
+through it, so the relay can't read, alter or forge traffic, and can't
+impersonate either side. The protocol is open; the spec lives in the Hive repo
+(`docs/relay-tunnel.md`, with golden vectors in `docs/relay-tunnel/`).
+
+**Off by default.** A relay upgraded to this version does not become a public
+tunnel provider. Enable it with `HIVE_RELAY_TUNNEL=open` (any host may
+register) or `HIVE_RELAY_TUNNEL=allowlist` + `HIVE_RELAY_TUNNEL_HOSTS=<host_id>,…`.
+When the relay's entitlement gate is configured (`HIVE_RELAY_TOKEN_PUBKEY` /
+`HIVE_RELAY_ACCESS_TOKENS`), a host's first registration must also present a
+token that passes it (`hive remote enable --reg-token …`).
+
+Endpoints (WebSockets require the subprotocol `hive-tunnel.1`, else `426`;
+they authenticate themselves, so they bypass the bearer-token gate):
+
+| Route | Who | What |
+|---|---|---|
+| `GET /v1/tunnel/info` | anyone | `{"versions":[1],"push":bool,"billing":"none"}` (`404` when off) |
+| `GET /v1/tunnel/host` | host | control socket: Ed25519-signed challenge; `host_id = H(host key)`, registered implicitly on first connect |
+| `GET /v1/tunnel/accept?sid=…` | host | one data socket per phone session (`sid` is single-use, valid 10 s) |
+| `GET /v1/tunnel/connect?host=…` | phone | host-signed `hpc1` credential + proof-of-possession signature (or a pairing-window tag to enroll), then a 1:1 splice to the host |
+
+What the relay stores (both backends; part of the snapshot / database):
+registered hosts `(host_id, pub, created_at, last_seen)`, revoked phones
+`(host_id, pid, exp)` until their credentials would have expired, and APNs push
+tokens. It never holds a key that opens session traffic.
+
+Limits (spec defaults): 8 KiB text / 65 535 B binary messages; 8 concurrent
+sessions per host and 3 per phone; 60 sessions opened per host per minute; 30
+connects per IP per minute, and 10 failed auths per minute blocks the IP for
+5 minutes; 2 enrollment windows per host (≤ 15 min, 5 attempts each);
+enrollment sessions capped at 5 min / 4 MiB; 20 control messages per second.
+Every tunnel socket is pinged every 20 s and closed after 60 s of silence; the
+`http.Server` read/write timeouts are cleared on upgrade. On shutdown every
+tunnel socket is closed with `4011 shutting_down` (wired via
+`http.Server.RegisterOnShutdown(srv.ShutdownTunnels)`).
+
+**One instance per host.** Live control connections are kept in process: run a
+single relay instance for the tunnel, or route `/v1/tunnel/connect?host=H` and
+`/v1/tunnel/accept` to the instance holding H's control connection.
+
+Hosted deployments inject their own `TunnelPolicy` (entitlement: hosts can be
+`pending` — enrollment works, sessions get `4006`; pending hosts unseen for 30
+days are forgotten) and an APNs `PushSender` via `Options`. Without a
+`PushSender` (the open build) host pushes are acked `push_unavailable`.
+
 ## Extending (seams)
 
 This package is a complete relay on its own. It also exposes extension points
@@ -197,6 +249,10 @@ This package is a complete relay on its own. It also exposes extension points
 - **`WriteGuard`** — optional pre-write authorization hook (`nil` = content-blind).
 - **`Hooks`** — optional lifecycle observers (e.g. audit / accounting; no-op by
   default).
+- **`TunnelPolicy`** / **`PushSender`** — relay-tunnel host admission and
+  entitlement (`nil` = `HIVE_RELAY_TUNNEL` env policy), and end-to-end
+  encrypted push delivery (`nil` = unavailable). A `Store` that also implements
+  `TunnelStore` keeps tunnel state durable (both built-in backends do).
 
 ## License
 

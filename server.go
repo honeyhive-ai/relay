@@ -63,6 +63,16 @@ type Options struct {
 	// Also enabled by env HIVE_RELAY_MEMBERSHIP=1. Off → the relay is unchanged
 	// (no roster routes, content-blind forwarding).
 	Membership bool
+	// TunnelPolicy enables the hive-tunnel/1 phone ↔ host relay (tunnel.go).
+	// nil → TunnelPolicyFromEnv semantics: HIVE_RELAY_TUNNEL=off|open|allowlist
+	// (default off = /v1/tunnel/* answers 404).
+	TunnelPolicy TunnelPolicy
+	// PushSender delivers end-to-end encrypted pushes for tunnel hosts.
+	// nil → push unavailable.
+	PushSender PushSender
+	// TunnelBilling is advertised by GET /v1/tunnel/info: "none" (default) or
+	// "appstore".
+	TunnelBilling string
 }
 
 // Server holds the durable Store plus the ephemeral, instance-local pieces
@@ -100,6 +110,8 @@ type Server struct {
 	ghCache        *identityCache      // token-hash → identity, short TTL
 	metricsToken   string              // ops credential for /metrics (env; "" = open)
 	metricsTokHash string              // sha256 of metricsToken for constant-time compare
+
+	tunnel *tunnelHub // nil = tunnel off
 
 	healthMu      sync.Mutex // guards the cached /v1/health ping result
 	healthErr     error
@@ -148,6 +160,15 @@ func New(o Options) *Server {
 		s.metricsTokHash = sha256hex(metricsToken)
 	}
 	s.verify = s.verifyGitHub
+	tunnelPolicy := o.TunnelPolicy
+	if tunnelPolicy == nil {
+		// The registration token must pass the relay's own entitlement gate when
+		// one is configured (hrt1 / access tokens); open entitlement admits any.
+		tunnelPolicy = tunnelPolicyFromEnv(s.entitlement)
+	}
+	if tunnelPolicy != nil {
+		s.tunnel = newTunnelHub(s.store, tunnelPolicy, o.PushSender, o.TunnelBilling)
+	}
 	// When membership is on, default the guards to the built-in roster guard
 	// (unless a downstream build supplied its own). The guard is content-blind
 	// and no-ops for unclaimed workspaces, so this never breaks the open default.
@@ -245,14 +266,32 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/admin/users/{id}/disabled", s.adminSetDisabled)
 	mux.HandleFunc("DELETE /v1/admin/tokens/{id}", s.adminRevokeToken)
 
+	// Relay tunnel (hive-tunnel/1). Off → unregistered, so /v1/tunnel/* is 404.
+	if s.tunnel != nil {
+		s.tunnel.register(mux)
+	}
+
 	return m.observe(s.gate(mux))
+}
+
+// ShutdownTunnels closes every tunnel WebSocket with shutting_down (4011) and
+// stops tunnel housekeeping. Wire it to http.Server.RegisterOnShutdown: hijacked
+// connections aren't closed by http.Server.Shutdown.
+func (s *Server) ShutdownTunnels() {
+	if s.tunnel != nil {
+		s.tunnel.shutdown()
+	}
 }
 
 // gate rejects /v1/* (except health) unless the caller is entitled, and stashes
 // the verified claims in the request context for downstream enforcement.
 func (s *Server) gate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" || r.URL.Path == "/v1/health" || r.URL.Path == "/metrics" || strings.HasPrefix(r.URL.Path, "/v1/admin/") {
+		if r.URL.Path == "/" || r.URL.Path == "/v1/health" || r.URL.Path == "/metrics" || strings.HasPrefix(r.URL.Path, "/v1/admin/") ||
+			strings.HasPrefix(r.URL.Path, "/v1/tunnel/") {
+			// The tunnel authenticates hosts and phones itself (signed
+			// challenges + host-signed credentials); a host's registration
+			// token is checked against this same entitlement (tunnel_policy.go).
 			// The status page, health, and metrics are public; the admin API runs
 			// its own AdminAuthorizer (an operator credential, not a relay token).
 			next.ServeHTTP(w, r)

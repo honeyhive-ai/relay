@@ -29,6 +29,8 @@ type snapshot struct {
 	Users       map[string]UserRecord    `json:"users,omitempty"`
 	Tokens      map[string]tokenSnap     `json:"tokens,omitempty"`
 	NextIDSeq   uint64                   `json:"nextIdSeq,omitempty"`
+	// Relay tunnel hosts / revocations / push tokens; absent from older snapshots.
+	Tunnel *tunnelSnap `json:"tunnel,omitempty"`
 }
 
 type tokenSnap struct {
@@ -223,6 +225,7 @@ func (s *memoryStore) restore(snap snapshot) {
 		s.tokenHash[t.Hash] = id
 	}
 	s.nextIDSeq = snap.NextIDSeq
+	s.restoreTunnel(snap.Tunnel)
 }
 
 func (s *memoryStore) toSnapshot() snapshot {
@@ -239,6 +242,7 @@ func (s *memoryStore) toSnapshot() snapshot {
 		Users:       map[string]UserRecord{},
 		Tokens:      map[string]tokenSnap{},
 		NextIDSeq:   s.nextIDSeq,
+		Tunnel:      s.toTunnelSnap(),
 	}
 	for id, u := range s.users {
 		snap.Users[id] = *u

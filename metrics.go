@@ -1,8 +1,11 @@
 package relay
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -48,6 +51,20 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 }
 
 func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+// Hijack lets the tunnel's WebSocket upgrade take over the connection
+// (recorded as 101 Switching Protocols).
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("response writer does not support hijacking")
+	}
+	if !r.wrote {
+		r.status = http.StatusSwitchingProtocols
+		r.wrote = true
+	}
+	return h.Hijack()
+}
 
 func (r *statusRecorder) Flush() {
 	if f, ok := r.ResponseWriter.(http.Flusher); ok {
@@ -113,6 +130,10 @@ var routeTemplates = [][]string{
 	{"v1", "admin", "users", "{}", "disabled"},
 	{"v1", "admin", "users"},
 	{"v1", "admin", "tokens", "{}"},
+	{"v1", "tunnel", "info"},
+	{"v1", "tunnel", "host"},
+	{"v1", "tunnel", "accept"},
+	{"v1", "tunnel", "connect"},
 }
 
 // routeTemplate maps a request path to its logged template (secret segments

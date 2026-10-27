@@ -97,7 +97,10 @@ func (s *postgresStore) Ping(ctx context.Context) error { return s.pool.Ping(ctx
 // migrate creates the schema (idempotent — safe to run on every boot and from
 // every instance).
 func (s *postgresStore) migrate(ctx context.Context) error {
-	_, err := s.pool.Exec(ctx, schemaSQL)
+	if _, err := s.pool.Exec(ctx, schemaSQL); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx, tunnelSchemaSQL)
 	return err
 }
 
