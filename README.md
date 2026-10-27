@@ -230,16 +230,44 @@ tunnel socket is closed with `4011 shutting_down` (wired via
 single relay instance for the tunnel, or route `/v1/tunnel/connect?host=H` and
 `/v1/tunnel/accept` to the instance holding H's control connection.
 
+**Self-hosting the tunnel.** `HIVE_RELAY_TUNNEL=open` gives your own relay the
+same remote access the paid hosted relay offers, for free: every registered
+host is `active`. `GET /v1/tunnel/info` then reports `"billing":"none"`, and
+the Hive app uses that to skip its subscription paywall (it shows "ask the
+relay operator" on `4006` instead). Only the hosted build reports
+`"billing":"appstore"`.
+
+**Push on a self-hosted relay.** Without a `PushSender` (the open build) host
+pushes are acked `push_unavailable`, and `hive serve` falls back to ntfy when
+it's configured. A self-hosted relay can't deliver APNs pushes to the App
+Store build of the Hive app: APNs only accepts pushes for an app signed with
+that app's APNs key, which only the app's publisher holds. Proposed (not
+built): an optional push gateway on the hosted service that accepts the same
+end-to-end encrypted `ct` from a self-hosted relay and forwards it to APNs, so
+the gateway sees only ciphertext plus the device token. It would need its own
+abuse controls (a per-relay key and rate limits) and may be a paid feature.
+
 Hosted deployments inject their own `TunnelPolicy` (entitlement: hosts can be
 `pending` — enrollment works, sessions get `4006`; pending hosts unseen for 30
-days are forgotten) and an APNs `PushSender` via `Options`. Without a
-`PushSender` (the open build) host pushes are acked `push_unavailable`.
+days are forgotten) and an APNs `PushSender`, through `MainWith` (below).
 
 ## Extending (seams)
 
 This package is a complete relay on its own. It also exposes extension points
 (see `seams.go`) so a downstream build can add custom behavior via
-`New(Options{...})` without forking:
+`New(Options{...})` without forking.
+
+A downstream binary that must behave exactly like `cmd/hive-relay` plus a few
+additions (for example a hosted build that shares an app with the open relay)
+calls `relay.MainWith(relay.Extension{...})` instead of `relay.Main()`.
+Storage, env, the entitlement gate, every open route, subcommands and shutdown
+are the open binary's; the extension can only set the tunnel seams, serve extra
+routes under `/v1/<name>/` prefixes the relay doesn't use, and add
+subcommands. If its setup fails, the relay logs it and serves as the open
+binary. `relay.Assemble` builds the same handler without a listener, for
+side-by-side tests.
+
+Seams:
 
 - **`Store`** — durable backend (in-memory/snapshot or Postgres built in);
   includes the user/token store behind the admin API.

@@ -202,7 +202,8 @@ func claimsFrom(ctx context.Context) *TokenClaims {
 
 func nowUnix() int64 { return time.Now().Unix() }
 
-// Handler builds the /v1 router. Everything except /v1/health sits behind the
+// Handler builds the /v1 router. Keep relayPrefixes (extension.go) covering
+// every path registered here. Everything except /v1/health sits behind the
 // entitlement gate (a no-op when the policy is Open, i.e. self-hosted).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()

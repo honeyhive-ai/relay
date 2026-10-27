@@ -26,7 +26,17 @@ import (
 //
 // $HIVE_RELAY_FRIEND_CAP (optional) caps accepted friends per account.
 
-func Main() {
+// Main runs the open relay binary (cmd/hive-relay).
+func Main() { MainWith(Extension{}) }
+
+// MainWith runs the relay binary with a downstream Extension. Everything the
+// open binary does is unchanged: subcommands, storage selection
+// (DATABASE_URL / HIVE_RELAY_DATA_DIR / HIVE_RELAY_REQUIRE_DB), the address
+// ($PORT / HIVE_RELAY_ADDR), every env knob, the entitlement gate, the /v1
+// sync and admin routes, snapshot flushing, pruning and graceful shutdown. An
+// extension only supplies the tunnel seams and extra routes (see Extension).
+// MainWith(Extension{}) is exactly Main().
+func MainWith(ext Extension) {
 	// Structured JSON logs (request lines come from the observability middleware).
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
@@ -46,15 +56,26 @@ func Main() {
 			printUsage()
 			return
 		}
+		if run, ok := ext.Commands[args[0]]; ok {
+			fatalIf(run(args[1:]))
+			return
+		}
 	}
 
 	store, err := buildStore(context.Background())
 	fatalIf(err)
 	defer store.Close()
 
-	// Open relay: default env entitlement, no write guard, no hooks. (The
-	// downstream binary can build its own Server via relay.New with custom seams.)
-	srv := New(Options{Store: store, FriendCap: friendCapFromEnv()})
+	// Stop on Ctrl-C or SIGTERM (a redeploy from the orchestrator).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	a, err := Assemble(ctx, store, ext)
+	if err != nil {
+		// An extension never takes the relay down: it serves as the open
+		// binary would (Assemble already fell back).
+		slog.Error("relay extension disabled; serving the open relay", "error", err)
+	}
 
 	// Periodically snapshot durable state so an unexpected crash loses at most a
 	// few seconds; a graceful shutdown flushes once more below.
@@ -76,7 +97,7 @@ func Main() {
 	// deadlines are safe.
 	httpServer := &http.Server{
 		Addr:              addr,
-		Handler:           srv.Handler(),
+		Handler:           a.Handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -84,11 +105,7 @@ func Main() {
 	}
 	// Tunnel WebSockets are hijacked (Shutdown doesn't see them): close them
 	// with shutting_down so clients reconnect with backoff.
-	httpServer.RegisterOnShutdown(srv.ShutdownTunnels)
-
-	// Stop on Ctrl-C or SIGTERM (a redeploy from the orchestrator).
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	httpServer.RegisterOnShutdown(a.Server.ShutdownTunnels)
 
 	go func() {
 		fmt.Printf("hive-relay listening on %s\n", addr)
@@ -104,6 +121,7 @@ func Main() {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = httpServer.Shutdown(shutCtx)
+	a.Close()
 
 	// Final flush on the way out so a planned redeploy never loses state.
 	if err := store.Flush(context.Background()); err != nil {
