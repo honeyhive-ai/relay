@@ -68,7 +68,8 @@ type Options struct {
 	// (default off = /v1/tunnel/* answers 404).
 	TunnelPolicy TunnelPolicy
 	// PushSender delivers end-to-end encrypted pushes for tunnel hosts.
-	// nil → push unavailable.
+	// nil → the built-in APNs sender when HIVE_RELAY_APNS_* is set
+	// (push_apns.go), else push unavailable.
 	PushSender PushSender
 	// TunnelBilling is advertised by GET /v1/tunnel/info: "none" (default) or
 	// "appstore".
@@ -167,7 +168,13 @@ func New(o Options) *Server {
 		tunnelPolicy = tunnelPolicyFromEnv(s.entitlement)
 	}
 	if tunnelPolicy != nil {
-		s.tunnel = newTunnelHub(s.store, tunnelPolicy, o.PushSender, o.TunnelBilling)
+		push := o.PushSender
+		if push == nil {
+			// The built-in APNs sender, when HIVE_RELAY_APNS_* is configured
+			// (push_apns.go); otherwise push stays unavailable.
+			push = pushSenderFromEnv()
+		}
+		s.tunnel = newTunnelHub(s.store, tunnelPolicy, push, o.TunnelBilling)
 	}
 	// When membership is on, default the guards to the built-in roster guard
 	// (unless a downstream build supplied its own). The guard is content-blind

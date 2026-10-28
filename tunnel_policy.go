@@ -9,8 +9,9 @@ import (
 	"strings"
 )
 
-// Tunnel seams (spec §15.1). The open build wires TunnelPolicyFromEnv and no
-// PushSender; a hosted downstream build injects its own through Options.
+// Tunnel seams (spec §15.1). The open build wires TunnelPolicyFromEnv and, when
+// HIVE_RELAY_APNS_* is configured, the built-in APNs PushSender (push_apns.go);
+// a hosted downstream build injects its own through Options.
 
 // HostStatus is a registered host's entitlement. !Active means "pending": the
 // host may hold its control connection and enroll phones, but phone sessions

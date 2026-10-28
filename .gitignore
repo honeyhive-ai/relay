@@ -3,3 +3,6 @@
 /hive-relay
 /relay
 *.test
+
+# Never commit APNs auth keys.
+*.p8

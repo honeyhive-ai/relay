@@ -9,6 +9,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -770,6 +771,11 @@ func (h *tunnelHub) handlePush(ctl *hostCtl, m relayMsg) {
 		return
 	}
 	if err := h.push.Send(ctx, ctl.hostID, m.PID, *tok, ct, prio, m.Collapse); err != nil {
+		if errors.Is(err, ErrPushTokenGone) {
+			// The push service says the token is dead: forget it, so later
+			// pushes ack no_push_token until the phone re-registers.
+			_ = h.store.SetTunnelPushToken(ctx, ctl.hostID, m.PID, nil, h.nowUnix())
+		}
 		h.ack(c, m.ID, "push_failed")
 		return
 	}

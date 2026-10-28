@@ -43,6 +43,10 @@ hive-relay issue --key <priv-hex> --sub <id> --plan team --exp-days 365 \
 | `HIVE_RELAY_MAX_BODY_BYTES` | max JSON request-body size in bytes (default `4194304` = 4 MiB) |
 | `HIVE_RELAY_TUNNEL` | relay tunnel (phone ↔ home host): `off` (**default**, `/v1/tunnel/*` → 404), `open` (any host may register), `allowlist` (only `HIVE_RELAY_TUNNEL_HOSTS`). See [Relay tunnel](#relay-tunnel-hive-tunnel1) |
 | `HIVE_RELAY_TUNNEL_HOSTS` | comma-separated `host_id`s admitted when `HIVE_RELAY_TUNNEL=allowlist` |
+| `HIVE_RELAY_APNS_KEY_FILE` | APNs auth key (`AuthKey_<KEYID>.p8`) for the built-in push sender; or `HIVE_RELAY_APNS_KEY` with the PEM inline (`\n` escapes allowed). Push is **off** unless the key and the three vars below are all set. See [Push from your own relay](#push-from-your-own-relay) |
+| `HIVE_RELAY_APNS_KEY_ID` / `HIVE_RELAY_APNS_TEAM_ID` | the key's Key ID and your Apple developer Team ID |
+| `HIVE_RELAY_APNS_TOPIC` | bundle id of the iPhone app build you publish (the APNs topic) |
+| `HIVE_RELAY_APNS_ENV` | `auto` (**default**: the environment each phone reports with its token: `development` → sandbox, `production` → production), `sandbox` or `production` |
 
 Storage selection: `DATABASE_URL` → Postgres; else `HIVE_RELAY_DATA_DIR` →
 memory+snapshot; else in-memory only.
@@ -237,15 +241,54 @@ the Hive app uses that to skip its subscription paywall (it shows "ask the
 relay operator" on `4006` instead). Only the hosted build reports
 `"billing":"appstore"`.
 
-**Push on a self-hosted relay.** Without a `PushSender` (the open build) host
-pushes are acked `push_unavailable`, and `hive serve` falls back to ntfy when
-it's configured. A self-hosted relay can't deliver APNs pushes to the App
-Store build of the Hive app: APNs only accepts pushes for an app signed with
-that app's APNs key, which only the app's publisher holds. Proposed (not
-built): an optional push gateway on the hosted service that accepts the same
-end-to-end encrypted `ct` from a self-hosted relay and forwards it to APNs, so
-the gateway sees only ciphertext plus the device token. It would need its own
-abuse controls (a per-relay key and rate limits) and may be a paid feature.
+**Push on a self-hosted relay.** Without a `PushSender` host pushes are acked
+`push_unavailable`, and `hive serve` falls back to ntfy when it's configured.
+APNs only accepts a push signed with a key from the Apple developer team that
+publishes the app, so a relay can push only to builds of the Hive app its
+operator publishes (see below). It can't push to someone else's App Store
+build. Proposed (not built): an optional push gateway run by the app's
+publisher that accepts the same end-to-end encrypted `ct` from a self-hosted
+relay and forwards it to APNs, so the gateway sees only ciphertext plus the
+device token. It would need its own abuse controls (a per-relay key and rate
+limits).
+
+### Push from your own relay
+
+If you build and sign the iPhone app under your own Apple developer account,
+your relay can push to it with the built-in APNs sender:
+
+1. In the Apple developer portal (Certificates, Identifiers & Profiles → Keys)
+   create a key with **Apple Push Notifications service (APNs)** enabled.
+   Download the `.p8` once and keep it secret; note its Key ID and your Team ID.
+2. Run the relay with the tunnel on and the key configured:
+
+   ```sh
+   HIVE_RELAY_TUNNEL=open \
+   HIVE_RELAY_APNS_KEY_FILE=/secrets/AuthKey_ABC123DEFG.p8 \
+   HIVE_RELAY_APNS_KEY_ID=ABC123DEFG \
+   HIVE_RELAY_APNS_TEAM_ID=<your team id> \
+   HIVE_RELAY_APNS_TOPIC=<your app's bundle id> \
+   hive-relay
+   ```
+
+   The relay logs `tunnel push via APNs (topic …, env auto)`, and
+   `GET /v1/tunnel/info` and the host's `welcome` report `"push": true`. An
+   incomplete configuration or a key that doesn't parse is logged and leaves
+   push off; the relay still starts.
+3. Build the app with push enabled (the iOS repo's docs), pair the phone with a
+   host that uses this relay, and allow notifications.
+
+The relay forwards the host's ciphertext untouched in the spec §14 payload
+(`{"aps":{"alert":{"title":"Hive","body":"New activity on your host"},"mutable-content":1},"hive":{…,"ct":…}}`)
+with `apns-push-type: alert`, priority 10 (`high`) or 5 (`normal`),
+`apns-expiration` now + 1 h and the host's opaque collapse id. When APNs says
+a device token is dead (`410 Unregistered`, `BadDeviceToken`,
+`DeviceTokenNotForTopic`) the relay forgets it; the phone sends a fresh one
+on its next connect. One relay serves one topic, so point
+`HIVE_RELAY_APNS_TOPIC` at the build you use (a dev build and an App Store
+build have different bundle ids). With `HIVE_RELAY_APNS_ENV=auto` a debug
+build from Xcode (sandbox token) and a TestFlight/App Store build
+(production token) both work.
 
 Hosted deployments inject their own `TunnelPolicy` (entitlement: hosts can be
 `pending` — enrollment works, sessions get `4006`; pending hosts unseen for 30
@@ -279,7 +322,10 @@ Seams:
   default).
 - **`TunnelPolicy`** / **`PushSender`** — relay-tunnel host admission and
   entitlement (`nil` = `HIVE_RELAY_TUNNEL` env policy), and end-to-end
-  encrypted push delivery (`nil` = unavailable). A `Store` that also implements
+  encrypted push delivery (`nil` = the built-in APNs sender when
+  `HIVE_RELAY_APNS_*` is set, else unavailable). The sender itself is the
+  importable `github.com/honeyhive-ai/relay/apns` package; a sender that wraps
+  `relay.ErrPushTokenGone` makes the relay forget that phone's token. A `Store` that also implements
   `TunnelStore` keeps tunnel state durable (both built-in backends do).
 
 ## License
