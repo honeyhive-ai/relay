@@ -508,9 +508,18 @@ func (s *Server) listEnvelopes(w http.ResponseWriter, r *http.Request) {
 	if !s.enforceRead(w, r, r.PathValue("id")) {
 		return
 	}
-	rows, err := s.store.EnvelopesAfter(r.Context(), r.PathValue("id"), afterParam(r))
+	after := afterParam(r)
+	rows, more, err := pageEnvelopes(r.Context(), s.store, r.PathValue("id"), after, limitParam(r), envelopePageMaxBytes)
 	if storeErr(w, err) {
 		return
+	}
+	next := after
+	if len(rows) > 0 {
+		next = rows[len(rows)-1].Seq
+	}
+	w.Header().Set(headerEnvelopesNext, strconv.FormatUint(next, 10))
+	if more {
+		w.Header().Set(headerEnvelopesMore, "true")
 	}
 	writeJSON(w, http.StatusOK, rows)
 }

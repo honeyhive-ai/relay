@@ -285,6 +285,27 @@ func (s *memoryStore) EnvelopesAfter(_ context.Context, workspace string, after 
 	return out, nil
 }
 
+// EnvelopesPage satisfies envelopePager: one bounded page past after, without
+// copying the rest of the log.
+func (s *memoryStore) EnvelopesPage(_ context.Context, workspace string, after uint64, limit, maxBytes int) ([]Envelope, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	pb := newPageBuilder(limit, maxBytes)
+	w := s.workspaces[workspace]
+	if w == nil {
+		return pb.rows, false, nil
+	}
+	// Seqs are appended in increasing order (pruning drops a prefix), so the
+	// first envelope past the cursor is found by binary search.
+	start := sort.Search(len(w.envelopes), func(i int) bool { return w.envelopes[i].Seq > after })
+	for _, e := range w.envelopes[start:] {
+		if !pb.add(e) {
+			return pb.rows, true, nil
+		}
+	}
+	return pb.rows, false, nil
+}
+
 func (s *memoryStore) PutCandidate(_ context.Context, workspace, deviceID string, candidate json.RawMessage) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

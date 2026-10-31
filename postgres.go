@@ -443,6 +443,44 @@ func (s *postgresStore) EnvelopesAfter(ctx context.Context, workspace string, af
 	return out, rows.Err()
 }
 
+// EnvelopesPage satisfies envelopePager: one bounded page past after. The row
+// count is bounded in SQL (limit+1, the extra row only proves "more"), and a
+// running byte sum stops Postgres from shipping bodies past the byte budget.
+// The page is the first row plus every row ending within the budget (a prefix);
+// the filter keeps exactly that prefix and the one row after it, which only
+// proves "more": a row is kept when it is one of the first two, or when it
+// starts within the budget (its predecessor ended there, so was in the page).
+func (s *postgresStore) EnvelopesPage(ctx context.Context, workspace string, after uint64, limit, maxBytes int) ([]Envelope, bool, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT seq, body FROM (
+		   SELECT seq, body,
+		          row_number() OVER (ORDER BY seq) AS rn,
+		          sum(octet_length(body)) OVER (ORDER BY seq) - octet_length(body) AS start_off
+		   FROM (SELECT seq, body FROM relay_envelopes
+		         WHERE workspace = $1 AND seq > $2 ORDER BY seq LIMIT $3) head
+		 ) paged
+		 WHERE rn <= 2 OR start_off <= $4
+		 ORDER BY seq`,
+		workspace, after, limit+1, maxBytes)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	pb := newPageBuilder(limit, maxBytes)
+	for rows.Next() {
+		var e Envelope
+		var body []byte
+		if err := rows.Scan(&e.Seq, &body); err != nil {
+			return nil, false, err
+		}
+		e.Body = json.RawMessage(body)
+		if !pb.add(e) {
+			return pb.rows, true, nil
+		}
+	}
+	return pb.rows, false, rows.Err()
+}
+
 func (s *postgresStore) PutCandidate(ctx context.Context, workspace, deviceID string, candidate json.RawMessage) error {
 	if _, err := s.pool.Exec(ctx,
 		`INSERT INTO relay_candidates (workspace, device_id, blob) VALUES ($1, $2, $3)

@@ -119,6 +119,21 @@ that still holds history. Size the bounds above your expected offline window. Fo
 unbounded, always-catch-up history, use the Postgres backend (disk-bound, not
 retained in RAM) instead.
 
+### Envelope paging
+
+`GET /v1/workspaces/{id}/envelopes?after=<seq>[&limit=<n>]` returns one bounded
+page, oldest first: at most `limit` envelopes (default and maximum 1000) and, past
+the first envelope, at most 4 MiB of stored body bytes. The body is the same bare
+JSON array as always; two response headers describe the page:
+
+- `X-Hive-Next-After: <seq>` — the cursor for the next request (the last seq in
+  the page, or `after` when the page is empty);
+- `X-Hive-More: true` — present only when envelopes past this page exist.
+
+A client loops `after = X-Hive-Next-After` until `X-Hive-More` is absent. A client
+that ignores the headers still converges: it sets its cursor to the highest seq it
+received and its next poll continues from there.
+
 ### Live push (Server-Sent Events)
 
 `GET /v1/workspaces/{id}/events` (`Content-Type: text/event-stream`) lets a
